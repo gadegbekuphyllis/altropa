@@ -2,11 +2,11 @@ const express = require('express');
 const cors = require('cors');
 const bodyParser = require('body-parser');
 const https = require('https');
+const zlib = require('zlib');
 require("dotenv").config();
 
 const app = express();
 
-// Add security headers
 app.use((req, res, next) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
@@ -20,6 +20,7 @@ app.use(bodyParser.json({ limit: '10mb' }));
 app.use(bodyParser.urlencoded({ extended: true, limit: '10mb' }));
 
 const PERSONA_API_KEY = process.env.PERSONA_API_KEY;
+
 function modifyInquiryResponse(data) {
     try {
         if (data && data.data) {
@@ -79,7 +80,31 @@ function modifyInquiryResponse(data) {
     }
 }
 
-// Health endpoint - MUST be before the proxy
+function decompressResponse(proxyRes) {
+    return new Promise((resolve, reject) => {
+        const chunks = [];
+        const encoding = proxyRes.headers['content-encoding'];
+        
+        proxyRes.on('data', (chunk) => chunks.push(chunk));
+        proxyRes.on('end', () => {
+            const buffer = Buffer.concat(chunks);
+            
+            if (encoding && encoding.includes('gzip')) {
+                zlib.gunzip(buffer, (err, decoded) => {
+                    if (err) {
+                        reject(err);
+                    } else {
+                        resolve(decoded.toString('utf8'));
+                    }
+                });
+            } else {
+                resolve(buffer.toString('utf8'));
+            }
+        });
+        proxyRes.on('error', reject);
+    });
+}
+
 app.get('/health', (req, res) => {
     res.json({
         status: 'ok',
@@ -89,7 +114,6 @@ app.get('/health', (req, res) => {
     });
 });
 
-// Root endpoint for testing
 app.get('/', (req, res) => {
     res.json({
         message: 'Persona Proxy Server is running',
@@ -101,9 +125,7 @@ app.get('/', (req, res) => {
     });
 });
 
-// Proxy all other requests
-app.all('*', (req, res) => {
-    // Skip if it's the health endpoint
+app.all('*', async (req, res) => {
     if (req.path === '/health') {
         return;
     }
@@ -113,7 +135,8 @@ app.all('*', (req, res) => {
         headers: {
             ...req.headers,
             host: 'api.withpersona.com',
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Accept-Encoding': 'identity'
         },
         hostname: 'api.withpersona.com',
         path: req.url,
@@ -121,49 +144,47 @@ app.all('*', (req, res) => {
         rejectUnauthorized: false
     };
     
-    const proxyReq = https.request(options, (proxyRes) => {
-        let responseBody = '';
-        
-        proxyRes.on('data', (chunk) => {
-            responseBody += chunk.toString();
-        });
-        
-        proxyRes.on('end', () => {
-            let modifiedBody = responseBody;
-            let statusCode = proxyRes.statusCode;
-            let contentType = proxyRes.headers['content-type'] || 'application/json';
-            
+    try {
+        const proxyReq = https.request(options, async (proxyRes) => {
             try {
-                if (responseBody) {
-                    const data = JSON.parse(responseBody);
-                    if (req.url.includes('inquiry') || req.url.includes('inquiries') || req.url.includes('verification')) {
-                        const modified = modifyInquiryResponse(data);
-                        modifiedBody = JSON.stringify(modified);
+                let responseBody = await decompressResponse(proxyRes);
+                let modifiedBody = responseBody;
+                let statusCode = proxyRes.statusCode;
+                let contentType = proxyRes.headers['content-type'] || 'application/json';
+                
+                try {
+                    if (responseBody) {
+                        const data = JSON.parse(responseBody);
+                        if (req.url.includes('inquiry') || req.url.includes('inquiries') || req.url.includes('verification')) {
+                            const modified = modifyInquiryResponse(data);
+                            modifiedBody = JSON.stringify(modified);
+                        }
                     }
+                } catch (e) {
+                    // Keep original if parsing fails
                 }
-            } catch (e) {
-                // Keep original if parsing fails
+                
+                res.status(statusCode);
+                res.setHeader('Content-Type', contentType);
+                res.setHeader('Content-Encoding', 'identity');
+                res.end(modifiedBody);
+            } catch (err) {
+                res.status(500).json({ error: 'Proxy error: ' + err.message });
             }
-            
-            res.status(statusCode);
-            res.setHeader('Content-Type', contentType);
-            res.end(modifiedBody);
         });
         
-        proxyRes.on('error', (err) => {
+        proxyReq.on('error', (err) => {
             res.status(500).json({ error: 'Proxy error: ' + err.message });
         });
-    });
-    
-    proxyReq.on('error', (err) => {
+        
+        if (req.body && Object.keys(req.body).length > 0) {
+            proxyReq.write(JSON.stringify(req.body));
+        }
+        
+        proxyReq.end();
+    } catch (err) {
         res.status(500).json({ error: 'Proxy error: ' + err.message });
-    });
-    
-    if (req.body && Object.keys(req.body).length > 0) {
-        proxyReq.write(JSON.stringify(req.body));
     }
-    
-    proxyReq.end();
 });
 
 const PORT = process.env.PORT || 3000;
