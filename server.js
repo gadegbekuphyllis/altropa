@@ -20,65 +20,7 @@ app.use(bodyParser.json({ limit: '10mb' }));
 app.use(bodyParser.urlencoded({ extended: true, limit: '10mb' }));
 
 const PERSONA_API_KEY = process.env.PERSONA_API_KEY;
-
-function modifyInquiryResponse(data) {
-    try {
-        if (data && data.data) {
-            if (Array.isArray(data.data)) {
-                data.data.forEach(item => {
-                    if (item && item.attributes) {
-                        if (item.attributes.status === 'created' || item.attributes.status === 'pending') {
-                            item.attributes.status = 'COMPLETED';
-                        }
-                        if (item.attributes['verification-status'] === 'pending' || !item.attributes['verification-status']) {
-                            item.attributes['verification-status'] = 'verified';
-                        }
-                        if (item.attributes.failureReasons) {
-                            item.attributes.failureReasons = [];
-                        }
-                        if (item.attributes.latestFailureReasons) {
-                            item.attributes.latestFailureReasons = [];
-                        }
-                        if (item.attributes.remainingAttempts !== undefined) {
-                            item.attributes.remainingAttempts = 3;
-                        }
-                        if (item.attributes['reusable-persona-status'] !== undefined) {
-                            item.attributes['reusable-persona-status'] = null;
-                        }
-                        if (item.attributes['is-reusable-persona-trusted-device'] === false) {
-                            item.attributes['is-reusable-persona-trusted-device'] = true;
-                        }
-                    }
-                });
-            } else if (data.data.attributes) {
-                if (data.data.attributes.status === 'created' || data.data.attributes.status === 'pending') {
-                    data.data.attributes.status = 'COMPLETED';
-                }
-                if (data.data.attributes['verification-status'] === 'pending' || !data.data.attributes['verification-status']) {
-                    data.data.attributes['verification-status'] = 'verified';
-                }
-                if (data.data.attributes.failureReasons) {
-                    data.data.attributes.failureReasons = [];
-                }
-                if (data.data.attributes.latestFailureReasons) {
-                    data.data.attributes.latestFailureReasons = [];
-                }
-                if (data.data.attributes.remainingAttempts !== undefined) {
-                    data.data.attributes.remainingAttempts = 3;
-                }
-                if (data.data.attributes['reusable-persona-status'] !== undefined) {
-                    data.data.attributes['reusable-persona-status'] = null;
-                }
-                if (data.data.attributes['is-reusable-persona-trusted-device'] === false) {
-                    data.data.attributes['is-reusable-persona-trusted-device'] = true;
-                }
-            }
-        }
-        return data;
-    } catch (e) {
-        return data;
-    }
-}
+const inquiryState = {};
 
 function decompressResponse(proxyRes) {
     return new Promise((resolve, reject) => {
@@ -103,6 +45,53 @@ function decompressResponse(proxyRes) {
         });
         proxyRes.on('error', reject);
     });
+}
+
+function getInquiryId(req) {
+    const match = req.url.match(/\/inquiries\/([^\/?]+)/);
+    if (match) return match[1];
+    
+    if (req.body?.data?.id) return req.body.data.id;
+    if (req.body?.data?.attributes?.inquiry_id) return req.body.data.attributes.inquiry_id;
+    if (req.body?.data?.attributes?.inquiry) return req.body.data.attributes.inquiry;
+    
+    return null;
+}
+
+function modifyInquiryResponse(data, inquiryId) {
+    try {
+        if (!data?.data) return data;
+        
+        const state = inquiryState[inquiryId];
+        const isComplete = state?.countrySelected && state?.idUploaded && state?.selfieVerified;
+        
+        if (Array.isArray(data.data)) {
+            data.data.forEach(item => {
+                if (item?.attributes) {
+                    if (isComplete) {
+                        item.attributes.status = 'COMPLETED';
+                        item.attributes['verification-status'] = 'verified';
+                        item.attributes.failureReasons = [];
+                        item.attributes.latestFailureReasons = [];
+                        item.attributes.remainingAttempts = 3;
+                    }
+                }
+            });
+        } else if (data.data.attributes) {
+            if (isComplete) {
+                data.data.attributes.status = 'COMPLETED';
+                data.data.attributes['verification-status'] = 'verified';
+                data.data.attributes.failureReasons = [];
+                data.data.attributes.latestFailureReasons = [];
+                data.data.attributes.remainingAttempts = 3;
+                data.data.attributes['reusable-persona-status'] = null;
+                data.data.attributes['is-reusable-persona-trusted-device'] = true;
+            }
+        }
+        return data;
+    } catch (e) {
+        return data;
+    }
 }
 
 app.get('/health', (req, res) => {
@@ -130,6 +119,34 @@ app.all('*', async (req, res) => {
         return;
     }
 
+    const inquiryId = getInquiryId(req);
+
+    if (req.url.includes('/inquiries') && req.method === 'PATCH') {
+        try {
+            const body = JSON.parse(req.body);
+            if (body?.data?.attributes?.fields?.selected_country_code) {
+                if (inquiryId) {
+                    if (!inquiryState[inquiryId]) inquiryState[inquiryId] = {};
+                    inquiryState[inquiryId].countrySelected = true;
+                }
+            }
+        } catch (e) {}
+    }
+
+    if (req.url.includes('/documents') || req.url.includes('/uploads')) {
+        if (inquiryId) {
+            if (!inquiryState[inquiryId]) inquiryState[inquiryId] = {};
+            inquiryState[inquiryId].idUploaded = true;
+        }
+    }
+
+    if (req.url.includes('/verifications') || req.url.includes('/selfies')) {
+        if (inquiryId) {
+            if (!inquiryState[inquiryId]) inquiryState[inquiryId] = {};
+            inquiryState[inquiryId].selfieVerified = true;
+        }
+    }
+
     const options = {
         method: req.method,
         headers: {
@@ -155,14 +172,18 @@ app.all('*', async (req, res) => {
                 try {
                     if (responseBody) {
                         const data = JSON.parse(responseBody);
+                        
+                        let id = inquiryId;
+                        if (!id && data?.data?.id) {
+                            id = data.data.id;
+                        }
+                        
                         if (req.url.includes('inquiry') || req.url.includes('inquiries') || req.url.includes('verification')) {
-                            const modified = modifyInquiryResponse(data);
+                            const modified = modifyInquiryResponse(data, id);
                             modifiedBody = JSON.stringify(modified);
                         }
                     }
-                } catch (e) {
-                    // Keep original if parsing fails
-                }
+                } catch (e) {}
                 
                 res.status(statusCode);
                 res.setHeader('Content-Type', contentType);
@@ -190,5 +211,4 @@ app.all('*', async (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log('Proxy server running on port ' + PORT);
-    console.log('Health check: /health');
 });
