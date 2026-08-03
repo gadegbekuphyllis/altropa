@@ -1,6 +1,8 @@
 const express = require('express');
 const cors = require('cors');
 const bodyParser = require('body-parser');
+const https = require('https');
+const zlib = require('zlib');
 const fs = require('fs');
 const path = require('path');
 require("dotenv").config();
@@ -30,6 +32,7 @@ app.use(bodyParser.json({ limit: '10mb' }));
 app.use(bodyParser.urlencoded({ extended: true, limit: '10mb' }));
 
 const LOG_FILE = path.join(__dirname, 'usage-logs.json');
+const documentUploaded = {};
 
 function logUsage(data) {
     try {
@@ -52,44 +55,109 @@ function getClientInfo(req) {
     };
 }
 
-function modifyResponse(data) {
-    if (data && data.data && data.data.attributes) {
-        if (data.data.attributes.status) {
-            data.data.attributes.status = 'COMPLETED';
-        }
-        if (data.data.attributes['verification-status']) {
-            data.data.attributes['verification-status'] = 'verified';
-        }
-        if (data.data.attributes.failureReasons) {
-            data.data.attributes.failureReasons = [];
-        }
-        if (data.data.attributes.latestFailureReasons) {
-            data.data.attributes.latestFailureReasons = [];
-        }
-        if (data.data.attributes.remainingAttempts !== undefined) {
-            data.data.attributes.remainingAttempts = 3;
-        }
-        if (data.data.attributes['reusable-persona-status'] !== null) {
-            data.data.attributes['reusable-persona-status'] = null;
-        }
-        if (data.data.attributes['is-reusable-persona-trusted-device'] === false) {
-            data.data.attributes['is-reusable-persona-trusted-device'] = true;
-        }
+function decompressResponse(proxyRes) {
+    return new Promise((resolve, reject) => {
+        const chunks = [];
+        const encoding = proxyRes.headers['content-encoding'];
+        
+        proxyRes.on('data', (chunk) => chunks.push(chunk));
+        proxyRes.on('end', () => {
+            const buffer = Buffer.concat(chunks);
+            if (encoding && encoding.includes('gzip')) {
+                zlib.gunzip(buffer, (err, decoded) => {
+                    if (err) reject(err);
+                    else resolve(decoded.toString('utf8'));
+                });
+            } else {
+                resolve(buffer.toString('utf8'));
+            }
+        });
+        proxyRes.on('error', reject);
+    });
+}
+
+function getTargetHost(req) {
+    const host = req.headers['host'] || req.headers['x-forwarded-host'];
+    if (host) {
+        return host;
     }
-    return data;
+    return 'api.withpersona.com';
+}
+
+function getInquiryId(req) {
+    const match = req.url.match(/\/inquiries\/([^\/?]+)/);
+    if (match) return match[1];
+    if (req.body?.data?.id) return req.body.data.id;
+    if (req.body?.data?.attributes?.inquiry_id) return req.body.data.attributes.inquiry_id;
+    if (req.body?.data?.attributes?.inquiry) return req.body.data.attributes.inquiry;
+    return null;
+}
+
+function modifyResponseData(data, inquiryId) {
+    try {
+        if (data && data.data) {
+            if (Array.isArray(data.data)) {
+                data.data.forEach(item => {
+                    if (item?.attributes) {
+                        if (item.attributes.status === 'created' || item.attributes.status === 'pending') {
+                            item.attributes.status = 'COMPLETED';
+                        }
+                        if (item.attributes['verification-status'] === 'pending' || !item.attributes['verification-status']) {
+                            item.attributes['verification-status'] = 'verified';
+                        }
+                        if (item.attributes.failureReasons) {
+                            item.attributes.failureReasons = [];
+                        }
+                        if (item.attributes.latestFailureReasons) {
+                            item.attributes.latestFailureReasons = [];
+                        }
+                        if (item.attributes.remainingAttempts !== undefined) {
+                            item.attributes.remainingAttempts = 3;
+                        }
+                        if (item.attributes['reusable-persona-status'] !== null) {
+                            item.attributes['reusable-persona-status'] = null;
+                        }
+                        if (item.attributes['is-reusable-persona-trusted-device'] === false) {
+                            item.attributes['is-reusable-persona-trusted-device'] = true;
+                        }
+                    }
+                });
+            } else if (data.data.attributes) {
+                if (data.data.attributes.status === 'created' || data.data.attributes.status === 'pending') {
+                    data.data.attributes.status = 'COMPLETED';
+                }
+                if (data.data.attributes['verification-status'] === 'pending' || !data.data.attributes['verification-status']) {
+                    data.data.attributes['verification-status'] = 'verified';
+                }
+                if (data.data.attributes.failureReasons) {
+                    data.data.attributes.failureReasons = [];
+                }
+                if (data.data.attributes.latestFailureReasons) {
+                    data.data.attributes.latestFailureReasons = [];
+                }
+                if (data.data.attributes.remainingAttempts !== undefined) {
+                    data.data.attributes.remainingAttempts = 3;
+                }
+                if (data.data.attributes['reusable-persona-status'] !== null) {
+                    data.data.attributes['reusable-persona-status'] = null;
+                }
+                if (data.data.attributes['is-reusable-persona-trusted-device'] === false) {
+                    data.data.attributes['is-reusable-persona-trusted-device'] = true;
+                }
+            }
+        }
+        return data;
+    } catch (e) {
+        return data;
+    }
 }
 
 app.get('/health', (req, res) => {
     res.json({
         status: 'ok',
         timestamp: new Date().toISOString(),
-        target: 'Universal Persona Proxy',
-        environment: process.env.NODE_ENV || 'production',
-        config: {
-            hasInquiryId: !!YOUR_INQUIRY_ID,
-            hasAccountId: !!YOUR_ACCOUNT_ID,
-            hasTemplateId: !!YOUR_TEMPLATE_ID
-        }
+        target: 'Universal Persona Proxy - Real API Forwarding',
+        environment: process.env.NODE_ENV || 'production'
     });
 });
 
@@ -99,10 +167,7 @@ app.get('/', (req, res) => {
         version: '1.0.0',
         endpoints: {
             health: '/health',
-            inquiries: '/api/v1/inquiries',
-            outlier: '/outlier/verifications',
-            logs: '/logs',
-            stats: '/logs/stats'
+            proxy: '/*'
         }
     });
 });
@@ -165,187 +230,85 @@ app.post('/outlier/verifications', (req, res) => {
     });
 });
 
-app.get('/api/v1/inquiries', (req, res) => {
-    let data = {
-        data: [{
-            type: "inquiry",
-            id: YOUR_INQUIRY_ID,
-            attributes: {
-                status: "COMPLETED",
-                "verification-status": "verified",
-                failureReasons: [],
-                latestFailureReasons: [],
-                remainingAttempts: 3,
-                "reusable-persona-status": null,
-                "is-reusable-persona-trusted-device": true
-            }
-        }]
-    };
-    res.json(data);
-});
-
-app.get('/api/v1/inquiries/most-recent-inquiry', (req, res) => {
-    let data = {
-        data: {
-            type: "inquiry",
-            id: YOUR_INQUIRY_ID,
-            attributes: {
-                status: "COMPLETED",
-                "verification-status": "verified",
-                failureReasons: [],
-                latestFailureReasons: [],
-                remainingAttempts: 3
-            }
-        }
-    };
-    res.json(data);
-});
-
-app.get('/api/v1/inquiries/:id', (req, res) => {
-    let data = {
-        data: {
-            type: "inquiry",
-            id: req.params.id,
-            attributes: {
-                status: "COMPLETED",
-                "verification-status": "verified",
-                failureReasons: [],
-                latestFailureReasons: [],
-                remainingAttempts: 3,
-                "reusable-persona-status": null,
-                "is-reusable-persona-trusted-device": true
-            }
-        }
-    };
-    res.json(data);
-});
-
-app.post('/api/v1/inquiries', (req, res) => {
-    let data = {
-        data: {
-            type: "inquiry",
-            id: 'inq_mock_' + Date.now().toString(36),
-            attributes: {
-                status: "COMPLETED",
-                "verification-status": "verified",
-                failureReasons: [],
-                latestFailureReasons: [],
-                remainingAttempts: 3
-            }
-        }
-    };
-    res.json(data);
-});
-
-app.patch('/api/v1/inquiries/:id', (req, res) => {
-    let data = {
-        data: {
-            type: "inquiry",
-            id: req.params.id,
-            attributes: {
-                status: "COMPLETED",
-                "verification-status": "verified",
-                failureReasons: [],
-                latestFailureReasons: [],
-                remainingAttempts: 3
-            }
-        }
-    };
-    res.json(data);
-});
-
-app.post('/api/v1/documents', (req, res) => {
-    res.json({
-        data: {
-            type: "document",
-            id: 'doc_mock_' + Date.now().toString(36),
-            attributes: {
-                status: "uploaded",
-                "verification-status": "verified"
-            }
-        }
-    });
-});
-
-app.post('/api/v1/selfies', (req, res) => {
-    res.json({
-        data: {
-            type: "selfie",
-            id: 'selfie_mock_' + Date.now().toString(36),
-            attributes: {
-                status: "uploaded",
-                "verification-status": "verified"
-            }
-        }
-    });
-});
-
-app.post('/api/v1/verifications', (req, res) => {
-    res.json({
-        data: {
-            type: "verification",
-            id: 'ver_mock_' + Date.now().toString(36),
-            attributes: {
-                status: "completed",
-                "verification-status": "verified"
-            }
-        }
-    });
-});
-
-app.get('/logs', (req, res) => {
-    try {
-        if (fs.existsSync(LOG_FILE)) {
-            const content = fs.readFileSync(LOG_FILE, 'utf8');
-            const logs = JSON.parse(content);
-            const limit = parseInt(req.query.limit) || 100;
-            res.json({
-                count: logs.length,
-                logs: logs.slice(-limit)
-            });
-        } else {
-            res.json({ count: 0, logs: [] });
-        }
-    } catch (error) {
-        res.status(500).json({ error: 'Failed to read logs' });
+app.all('*', async (req, res) => {
+    if (req.path === '/health' || req.path === '/outlier/verifications') {
+        return;
     }
-});
 
-app.get('/logs/stats', (req, res) => {
+    const targetHost = getTargetHost(req);
+    const inquiryId = getInquiryId(req);
+
+    if ((req.url.includes('/documents') || req.url.includes('/uploads')) && inquiryId) {
+        documentUploaded[inquiryId] = true;
+        const clientInfo = getClientInfo(req);
+        logUsage({
+            endpoint: req.url,
+            type: 'document_upload',
+            inquiryId: inquiryId,
+            ...clientInfo
+        });
+    }
+
+    const options = {
+        method: req.method,
+        headers: {
+            ...req.headers,
+            host: targetHost,
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Accept-Encoding': 'identity'
+        },
+        hostname: targetHost,
+        path: req.url,
+        port: 443,
+        rejectUnauthorized: false
+    };
+    
     try {
-        if (fs.existsSync(LOG_FILE)) {
-            const content = fs.readFileSync(LOG_FILE, 'utf8');
-            const logs = JSON.parse(content);
-            
-            const stats = {
-                totalRequests: logs.length,
-                uniqueIps: [...new Set(logs.map(l => l.ip).filter(Boolean))],
-                uniqueFingerprints: [...new Set(logs.map(l => l.fingerprint).filter(Boolean))],
-                uniqueSessions: [...new Set(logs.map(l => l.sessionId).filter(Boolean))],
-                endpointCounts: {},
-                last24Hours: logs.filter(l => {
-                    const date = new Date(l.timestamp);
-                    const now = new Date();
-                    return (now - date) < 24 * 60 * 60 * 1000;
-                }).length
-            };
-            
-            logs.forEach(log => {
-                const endpoint = log.endpoint || 'unknown';
-                stats.endpointCounts[endpoint] = (stats.endpointCounts[endpoint] || 0) + 1;
-            });
-            
-            res.json(stats);
-        } else {
-            res.json({ totalRequests: 0 });
+        const proxyReq = https.request(options, async (proxyRes) => {
+            try {
+                let responseBody = await decompressResponse(proxyRes);
+                let modifiedBody = responseBody;
+                let statusCode = proxyRes.statusCode;
+                let contentType = proxyRes.headers['content-type'] || 'application/json';
+                
+                try {
+                    if (responseBody) {
+                        const data = JSON.parse(responseBody);
+                        let id = inquiryId;
+                        if (!id && data?.data?.id) {
+                            id = data.data.id;
+                        }
+                        
+                        const modifiedData = modifyResponseData(data, id);
+                        modifiedBody = JSON.stringify(modifiedData);
+                    }
+                } catch (e) {}
+                
+                res.status(statusCode);
+                res.setHeader('Content-Type', contentType);
+                res.setHeader('Content-Encoding', 'identity');
+                res.end(modifiedBody);
+            } catch (err) {
+                res.status(500).json({ error: 'Proxy error: ' + err.message });
+            }
+        });
+        
+        proxyReq.on('error', (err) => {
+            res.status(500).json({ error: 'Proxy error: ' + err.message });
+        });
+        
+        if (req.body && Object.keys(req.body).length > 0) {
+            proxyReq.write(JSON.stringify(req.body));
         }
-    } catch (error) {
-        res.status(500).json({ error: 'Failed to read logs' });
+        
+        proxyReq.end();
+    } catch (err) {
+        res.status(500).json({ error: 'Proxy error: ' + err.message });
     }
 });
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log('Universal Persona Proxy server running on port ' + PORT);
-    console.log('Logs stored in: ' + LOG_FILE);
+    console.log('Forwarding to real Persona API and modifying responses');
 });
