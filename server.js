@@ -52,6 +52,33 @@ function getClientInfo(req) {
     };
 }
 
+function modifyResponse(data) {
+    if (data && data.data && data.data.attributes) {
+        if (data.data.attributes.status) {
+            data.data.attributes.status = 'COMPLETED';
+        }
+        if (data.data.attributes['verification-status']) {
+            data.data.attributes['verification-status'] = 'verified';
+        }
+        if (data.data.attributes.failureReasons) {
+            data.data.attributes.failureReasons = [];
+        }
+        if (data.data.attributes.latestFailureReasons) {
+            data.data.attributes.latestFailureReasons = [];
+        }
+        if (data.data.attributes.remainingAttempts !== undefined) {
+            data.data.attributes.remainingAttempts = 3;
+        }
+        if (data.data.attributes['reusable-persona-status'] !== null) {
+            data.data.attributes['reusable-persona-status'] = null;
+        }
+        if (data.data.attributes['is-reusable-persona-trusted-device'] === false) {
+            data.data.attributes['is-reusable-persona-trusted-device'] = true;
+        }
+    }
+    return data;
+}
+
 app.get('/health', (req, res) => {
     res.json({
         status: 'ok',
@@ -139,7 +166,7 @@ app.post('/outlier/verifications', (req, res) => {
 });
 
 app.get('/api/v1/inquiries', (req, res) => {
-    res.json({
+    let data = {
         data: [{
             type: "inquiry",
             id: YOUR_INQUIRY_ID,
@@ -153,11 +180,12 @@ app.get('/api/v1/inquiries', (req, res) => {
                 "is-reusable-persona-trusted-device": true
             }
         }]
-    });
+    };
+    res.json(data);
 });
 
 app.get('/api/v1/inquiries/most-recent-inquiry', (req, res) => {
-    res.json({
+    let data = {
         data: {
             type: "inquiry",
             id: YOUR_INQUIRY_ID,
@@ -169,11 +197,12 @@ app.get('/api/v1/inquiries/most-recent-inquiry', (req, res) => {
                 remainingAttempts: 3
             }
         }
-    });
+    };
+    res.json(data);
 });
 
 app.get('/api/v1/inquiries/:id', (req, res) => {
-    res.json({
+    let data = {
         data: {
             type: "inquiry",
             id: req.params.id,
@@ -187,15 +216,15 @@ app.get('/api/v1/inquiries/:id', (req, res) => {
                 "is-reusable-persona-trusted-device": true
             }
         }
-    });
+    };
+    res.json(data);
 });
 
 app.post('/api/v1/inquiries', (req, res) => {
-    const newId = 'inq_mock_' + Date.now().toString(36);
-    res.json({
+    let data = {
         data: {
             type: "inquiry",
-            id: newId,
+            id: 'inq_mock_' + Date.now().toString(36),
             attributes: {
                 status: "COMPLETED",
                 "verification-status": "verified",
@@ -204,11 +233,12 @@ app.post('/api/v1/inquiries', (req, res) => {
                 remainingAttempts: 3
             }
         }
-    });
+    };
+    res.json(data);
 });
 
 app.patch('/api/v1/inquiries/:id', (req, res) => {
-    res.json({
+    let data = {
         data: {
             type: "inquiry",
             id: req.params.id,
@@ -220,7 +250,8 @@ app.patch('/api/v1/inquiries/:id', (req, res) => {
                 remainingAttempts: 3
             }
         }
-    });
+    };
+    res.json(data);
 });
 
 app.post('/api/v1/documents', (req, res) => {
