@@ -1,16 +1,25 @@
 const express = require('express');
-const { createProxyMiddleware } = require('http-proxy-middleware');
 const cors = require('cors');
 const bodyParser = require('body-parser');
 const https = require('https');
-const http = require('http');
+require("dotenv").config();
 
 const app = express();
+
+// Add security headers
+app.use((req, res, next) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    next();
+});
+
 app.use(cors());
 app.use(bodyParser.json({ limit: '10mb' }));
 app.use(bodyParser.urlencoded({ extended: true, limit: '10mb' }));
 
-let documentUploaded = false;
+const PERSONA_API_KEY = process.env.PERSONA_API_KEY || 'REMOVED';
 
 function modifyInquiryResponse(data) {
     try {
@@ -71,59 +80,46 @@ function modifyInquiryResponse(data) {
     }
 }
 
-function modifyConfigResponse(data) {
-    try {
-        if (data?.data?.attributes?.config?.idclasses) {
-            const config = data.data.attributes.config;
-            config.idclasses = [
-                { 'class': 'id', 'name': 'National ID', 'country-code': null, 'allow-upload': true, 'requires-device': 'desktop', 'requires-sides': ['front', 'back'] },
-                { 'class': 'pp', 'name': 'Passport', 'country-code': null, 'allow-upload': true, 'requires-device': 'desktop', 'requires-sides': ['front'] },
-                { 'class': 'dl', 'name': "Driver's License", 'country-code': null, 'allow-upload': true, 'requires-device': 'desktop', 'requires-sides': ['front', 'back'] }
-            ];
-            config['country-code'] = null;
-            config['selected-country-code'] = null;
-            config['selected-subdivision-code'] = null;
-            config['require-country-selection'] = null;
-            config['country-select-mode'] = true;
-            config['field-key-country'] = null;
-            config['enabled-capture-options-desktop'] = ['upload', 'mobile_camera', 'web_camera'];
-            config['enabled-capture-options-mobile'] = ['upload', 'mobile_camera', 'web_camera'];
-            config['enabled-capture-options-native-mobile'] = ['upload', 'web_camera'];
-            config['device-handoff-enabled'] = true;
-            config['device-handoff-options'] = ['email', 'sms', 'qr'];
-            config['enabled-capture-file-types'] = ['image/jpg', 'image/jpeg', 'image/png', 'image/heic', 'image/heif', 'image/tiff', 'image/tif', 'application/pdf'];
-            config['device-handoff-email-disabled'] = false;
-            config['device-handoff-phone-number-disabled'] = false;
-            config['allow-file-upload'] = true;
-            config['device-handoff-list-style'] = 'none';
-            config['liveness-required'] = false;
-            config['require-liveness'] = false;
-            config['cancel-button-enabled'] = true;
-            config['back-step-enabled'] = true;
-            config['web-camera-manual-capture-delay-ms'] = 0;
-            config['native-mobile-camera-manual-capture-delay-ms'] = 0;
-            config['barcode-camera-manual-capture-delay-ms'] = 0;
-            config['image-capture-count'] = 5;
-            config['govid-design-version'] = 1;
-            config['disclaimer'] = 'desktop';
-        }
-        return data;
-    } catch (e) {
-        return data;
-    }
-}
+// Health endpoint - MUST be before the proxy
+app.get('/health', (req, res) => {
+    res.json({
+        status: 'ok',
+        timestamp: new Date().toISOString(),
+        target: 'https://api.withpersona.com',
+        environment: process.env.NODE_ENV || 'production'
+    });
+});
 
+// Root endpoint for testing
+app.get('/', (req, res) => {
+    res.json({
+        message: 'Persona Proxy Server is running',
+        version: '1.0.0',
+        endpoints: {
+            health: '/health',
+            proxy: '/*'
+        }
+    });
+});
+
+// Proxy all other requests
 app.all('*', (req, res) => {
-    const url = 'https://api.withpersona.com' + req.url;
-    const headers = { ...req.headers };
-    delete headers.host;
-    
+    // Skip if it's the health endpoint
+    if (req.path === '/health') {
+        return;
+    }
+
     const options = {
         method: req.method,
-        headers: headers,
+        headers: {
+            ...req.headers,
+            host: 'api.withpersona.com',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        },
         hostname: 'api.withpersona.com',
         path: req.url,
-        port: 443
+        port: 443,
+        rejectUnauthorized: false
     };
     
     const proxyReq = https.request(options, (proxyRes) => {
@@ -141,17 +137,13 @@ app.all('*', (req, res) => {
             try {
                 if (responseBody) {
                     const data = JSON.parse(responseBody);
-                    
                     if (req.url.includes('inquiry') || req.url.includes('inquiries') || req.url.includes('verification')) {
                         const modified = modifyInquiryResponse(data);
-                        modifiedBody = JSON.stringify(modified);
-                    } else if (req.url.includes('config')) {
-                        const modified = modifyConfigResponse(data);
                         modifiedBody = JSON.stringify(modified);
                     }
                 }
             } catch (e) {
-                // If parsing fails, keep original
+                // Keep original if parsing fails
             }
             
             res.status(statusCode);
@@ -175,16 +167,8 @@ app.all('*', (req, res) => {
     proxyReq.end();
 });
 
-app.get('/health', (req, res) => {
-    res.json({
-        status: 'ok',
-        timestamp: new Date().toISOString(),
-        target: 'https://api.withpersona.com',
-        documentUploaded: documentUploaded
-    });
-});
-
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log('Proxy server running on port ' + PORT);
+    console.log('Health check: /health');
 });
