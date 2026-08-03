@@ -140,7 +140,7 @@ app.all('*', async (req, res) => {
         }
     }
 
-    if (req.url.includes('/verifications') || req.url.includes('/relationships/verifications') || req.url.includes('/selfies') || req.url.includes('/relationships/selfies')) {
+    if (req.url.includes('/selfies') || req.url.includes('/relationships/selfies')) {
         if (inquiryId) {
             if (!inquiryState[inquiryId]) inquiryState[inquiryId] = {};
             inquiryState[inquiryId].selfieVerified = true;
