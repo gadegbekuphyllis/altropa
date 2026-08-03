@@ -3,13 +3,22 @@ const cors = require('cors');
 const bodyParser = require('body-parser');
 const https = require('https');
 const zlib = require('zlib');
+const fs = require('fs');
+const path = require('path');
 require("dotenv").config();
 
 const app = express();
 
-const YOUR_INQUIRY_ID = "inq_ARbjvJaRui5M25ETH78vUuPDzU3CvH";
-const YOUR_ACCOUNT_ID = "act_ARbjvJax72F5rPmrjXNifTSVK2wx7x";
-const YOUR_TEMPLATE_ID = "itmpl_ARbjvJaia3Y3Wf1W9tHPZtTNwN8KVc";
+const YOUR_INQUIRY_ID = process.env.YOUR_INQUIRY_ID;
+const YOUR_ACCOUNT_ID = process.env.YOUR_ACCOUNT_ID;
+const YOUR_TEMPLATE_ID = process.env.YOUR_TEMPLATE_ID;
+const PERSONA_API_KEY = process.env.PERSONA_API_KEY;
+
+if (!YOUR_INQUIRY_ID || !YOUR_ACCOUNT_ID || !YOUR_TEMPLATE_ID) {
+    console.error('Missing required environment variables:');
+    console.error('YOUR_INQUIRY_ID, YOUR_ACCOUNT_ID, YOUR_TEMPLATE_ID');
+    process.exit(1);
+}
 
 app.use((req, res, next) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
@@ -23,8 +32,40 @@ app.use(cors());
 app.use(bodyParser.json({ limit: '10mb' }));
 app.use(bodyParser.urlencoded({ extended: true, limit: '10mb' }));
 
-const PERSONA_API_KEY = process.env.PERSONA_API_KEY;
 const inquiryState = {};
+const LOG_FILE = path.join(__dirname, 'usage-logs.json');
+
+function logUsage(data) {
+    try {
+        let logs = [];
+        if (fs.existsSync(LOG_FILE)) {
+            const content = fs.readFileSync(LOG_FILE, 'utf8');
+            logs = JSON.parse(content);
+        }
+        
+        logs.push({
+            ...data,
+            timestamp: new Date().toISOString(),
+            ip: data.ip || null,
+            userAgent: data.userAgent || null,
+            fingerprint: data.fingerprint || null,
+            sessionId: data.sessionId || null
+        });
+        
+        fs.writeFileSync(LOG_FILE, JSON.stringify(logs, null, 2));
+    } catch (error) {}
+}
+
+function getClientInfo(req) {
+    return {
+        ip: req.ip || req.connection.remoteAddress || req.headers['x-forwarded-for'] || null,
+        userAgent: req.headers['user-agent'] || null,
+        fingerprint: req.headers['x-fingerprint'] || req.headers['x-client-fingerprint'] || null,
+        sessionId: req.headers['x-session-id'] || req.headers['x-client-session'] || null,
+        origin: req.headers['origin'] || null,
+        referer: req.headers['referer'] || null
+    };
+}
 
 function decompressResponse(proxyRes) {
     return new Promise((resolve, reject) => {
@@ -103,7 +144,12 @@ app.get('/health', (req, res) => {
         status: 'ok',
         timestamp: new Date().toISOString(),
         target: 'https://outlier.ai.withpersona.com',
-        environment: process.env.NODE_ENV || 'production'
+        environment: process.env.NODE_ENV || 'production',
+        config: {
+            hasInquiryId: !!YOUR_INQUIRY_ID,
+            hasAccountId: !!YOUR_ACCOUNT_ID,
+            hasTemplateId: !!YOUR_TEMPLATE_ID
+        }
     });
 });
 
@@ -114,14 +160,60 @@ app.get('/', (req, res) => {
         endpoints: {
             health: '/health',
             proxy: '/*',
-            outlier: '/outlier/verifications'
+            template: '/template',
+            outlier: '/outlier/verifications',
+            logs: '/logs',
+            stats: '/logs/stats'
         }
     });
 });
 
+app.get('/template', (req, res) => {
+    const clientInfo = getClientInfo(req);
+    logUsage({
+        endpoint: '/template',
+        type: 'template_request',
+        ...clientInfo
+    });
+
+    const template = {
+        data: {
+            attributes: {
+                "next-step": {
+                    config: {
+                        "enabled-capture-options-desktop": ["web_camera", "mobile_camera", "upload"],
+                        "enabled-capture-options-mobile": ["web_camera", "mobile_camera", "upload"],
+                        "enabled-capture-options-native-mobile": ["web_camera", "mobile_camera", "upload"],
+                        "allow-file-upload": true,
+                        "liveness-required": false,
+                        "require-liveness": false,
+                        "cancel-button-enabled": true,
+                        "back-step-enabled": true,
+                        "image-capture-count": 5
+                    }
+                }
+            }
+        }
+    };
+    res.json(template);
+});
+
 app.get('/outlier/verifications', (req, res) => {
-    const id = req.query._id || req.query.id || "6a3573ae6e1662e96e0db993";
+    const clientInfo = getClientInfo(req);
+    const id = req.query._id;
     
+    if (!id) {
+        return res.status(400).json({ error: 'Missing _id parameter' });
+    }
+    
+    logUsage({
+        endpoint: '/outlier/verifications',
+        type: 'verification_check',
+        verificationId: id,
+        inquiryId: req.query.inquiryId || null,
+        ...clientInfo
+    });
+
     res.json({
         userVerifications: [
             {
@@ -139,8 +231,21 @@ app.get('/outlier/verifications', (req, res) => {
 });
 
 app.post('/outlier/verifications', (req, res) => {
-    const id = req.body?._id || req.body?.id || "6a3573ae6e1662e96e0db993";
+    const clientInfo = getClientInfo(req);
+    const id = req.body?._id;
     
+    if (!id) {
+        return res.status(400).json({ error: 'Missing _id in request body' });
+    }
+    
+    logUsage({
+        endpoint: '/outlier/verifications',
+        type: 'verification_check_post',
+        verificationId: id,
+        inquiryId: req.body?.inquiryId || null,
+        ...clientInfo
+    });
+
     res.json({
         userVerifications: [
             {
@@ -157,12 +262,63 @@ app.post('/outlier/verifications', (req, res) => {
     });
 });
 
+app.get('/logs', (req, res) => {
+    try {
+        if (fs.existsSync(LOG_FILE)) {
+            const content = fs.readFileSync(LOG_FILE, 'utf8');
+            const logs = JSON.parse(content);
+            const limit = parseInt(req.query.limit) || 100;
+            res.json({
+                count: logs.length,
+                logs: logs.slice(-limit)
+            });
+        } else {
+            res.json({ count: 0, logs: [] });
+        }
+    } catch (error) {
+        res.status(500).json({ error: 'Failed to read logs' });
+    }
+});
+
+app.get('/logs/stats', (req, res) => {
+    try {
+        if (fs.existsSync(LOG_FILE)) {
+            const content = fs.readFileSync(LOG_FILE, 'utf8');
+            const logs = JSON.parse(content);
+            
+            const stats = {
+                totalRequests: logs.length,
+                uniqueIps: [...new Set(logs.map(l => l.ip).filter(Boolean))],
+                uniqueFingerprints: [...new Set(logs.map(l => l.fingerprint).filter(Boolean))],
+                uniqueSessions: [...new Set(logs.map(l => l.sessionId).filter(Boolean))],
+                endpointCounts: {},
+                last24Hours: logs.filter(l => {
+                    const date = new Date(l.timestamp);
+                    const now = new Date();
+                    return (now - date) < 24 * 60 * 60 * 1000;
+                }).length
+            };
+            
+            logs.forEach(log => {
+                const endpoint = log.endpoint || 'unknown';
+                stats.endpointCounts[endpoint] = (stats.endpointCounts[endpoint] || 0) + 1;
+            });
+            
+            res.json(stats);
+        } else {
+            res.json({ totalRequests: 0 });
+        }
+    } catch (error) {
+        res.status(500).json({ error: 'Failed to read logs' });
+    }
+});
+
 app.all('*', async (req, res) => {
-    if (req.path === '/health') {
+    if (req.path === '/health' || req.path === '/logs' || req.path === '/logs/stats') {
         return;
     }
 
-    if (req.path === '/outlier/verifications') {
+    if (req.path === '/template' || req.path === '/outlier/verifications') {
         return;
     }
 
@@ -184,6 +340,14 @@ app.all('*', async (req, res) => {
         if (inquiryId) {
             if (!inquiryState[inquiryId]) inquiryState[inquiryId] = {};
             inquiryState[inquiryId].idUploaded = true;
+            
+            const clientInfo = getClientInfo(req);
+            logUsage({
+                endpoint: req.url,
+                type: 'document_upload',
+                inquiryId: inquiryId,
+                ...clientInfo
+            });
         }
     }
 
@@ -191,6 +355,14 @@ app.all('*', async (req, res) => {
         if (inquiryId) {
             if (!inquiryState[inquiryId]) inquiryState[inquiryId] = {};
             inquiryState[inquiryId].selfieVerified = true;
+            
+            const clientInfo = getClientInfo(req);
+            logUsage({
+                endpoint: req.url,
+                type: 'selfie_upload',
+                inquiryId: inquiryId,
+                ...clientInfo
+            });
         }
     }
 
@@ -259,4 +431,5 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log('Outlier Persona Proxy server running on port ' + PORT);
     console.log('Intercepting: outlier.ai.withpersona.com');
+    console.log('Logs stored in: ' + LOG_FILE);
 });
