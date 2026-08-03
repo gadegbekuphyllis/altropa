@@ -9,7 +9,7 @@ const app = express();
 
 app.use((req, res, next) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, PUT, DELETE, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
     res.setHeader('X-Content-Type-Options', 'nosniff');
     next();
@@ -133,14 +133,14 @@ app.all('*', async (req, res) => {
         } catch (e) {}
     }
 
-    if (req.url.includes('/documents') || req.url.includes('/uploads')) {
+    if (req.url.includes('/documents') || req.url.includes('/relationships/documents')) {
         if (inquiryId) {
             if (!inquiryState[inquiryId]) inquiryState[inquiryId] = {};
             inquiryState[inquiryId].idUploaded = true;
         }
     }
 
-    if (req.url.includes('/verifications') || req.url.includes('/selfies')) {
+    if (req.url.includes('/verifications') || req.url.includes('/relationships/verifications') || req.url.includes('/selfies') || req.url.includes('/relationships/selfies')) {
         if (inquiryId) {
             if (!inquiryState[inquiryId]) inquiryState[inquiryId] = {};
             inquiryState[inquiryId].selfieVerified = true;
