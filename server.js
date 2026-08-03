@@ -120,10 +120,12 @@ app.get('/', (req, res) => {
 });
 
 app.get('/outlier/verifications', (req, res) => {
+    const id = req.query._id || req.query.id || "6a3573ae6e1662e96e0db993";
+    
     res.json({
         userVerifications: [
             {
-                _id: req.query._id || "6a3573ae6e1662e96e0db993",
+                _id: id,
                 createdAt: new Date().toISOString(),
                 status: "inquiry.approved",
                 templateId: req.query.templateId || YOUR_TEMPLATE_ID,
@@ -137,10 +139,12 @@ app.get('/outlier/verifications', (req, res) => {
 });
 
 app.post('/outlier/verifications', (req, res) => {
+    const id = req.body?._id || req.body?.id || "6a3573ae6e1662e96e0db993";
+    
     res.json({
         userVerifications: [
             {
-                _id: req.body?._id || "6a3573ae6e1662e96e0db993",
+                _id: id,
                 createdAt: new Date().toISOString(),
                 status: "inquiry.approved",
                 templateId: req.body?.templateId || YOUR_TEMPLATE_ID,
