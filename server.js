@@ -31,7 +31,6 @@ app.use(cors());
 app.use(bodyParser.json({ limit: '10mb' }));
 app.use(bodyParser.urlencoded({ extended: true, limit: '10mb' }));
 
-const TARGET_HOST = 'outlier.ai.withpersona.com';
 const inquiryState = {};
 const LOG_FILE = path.join(__dirname, 'usage-logs.json');
 
@@ -117,11 +116,25 @@ function modifyInquiryResponse(data, inquiryId) {
     }
 }
 
+function getTargetHost(req) {
+    // Use the host from the request headers
+    const host = req.headers['host'];
+    if (host) {
+        // Extract the domain from the request
+        const domainMatch = host.match(/^(?:[^.]+\.)?(.+)$/);
+        if (domainMatch) {
+            return host;
+        }
+    }
+    // Default to standard Persona API
+    return 'api.withpersona.com';
+}
+
 app.get('/health', (req, res) => {
     res.json({
         status: 'ok',
         timestamp: new Date().toISOString(),
-        target: `https://${TARGET_HOST}`,
+        target: 'Dynamic - any Persona subdomain',
         environment: process.env.NODE_ENV || 'production',
         config: {
             hasInquiryId: !!YOUR_INQUIRY_ID,
@@ -133,114 +146,21 @@ app.get('/health', (req, res) => {
 
 app.get('/', (req, res) => {
     res.json({
-        message: 'Outlier Persona Proxy Server is running',
+        message: 'Universal Persona Proxy Server is running',
         version: '1.0.0',
         endpoints: {
             health: '/health',
-            template: '/template',
-            outlier: '/outlier/verifications',
-            logs: '/logs'
+            proxy: '/*'
         }
     });
-});
-
-app.get('/template', (req, res) => {
-    const clientInfo = getClientInfo(req);
-    logUsage({ endpoint: '/template', type: 'template_request', ...clientInfo });
-
-    const template = {
-        data: {
-            attributes: {
-                "next-step": {
-                    config: {
-                        "enabled-capture-options-desktop": ["web_camera", "mobile_camera", "upload"],
-                        "enabled-capture-options-mobile": ["web_camera", "mobile_camera", "upload"],
-                        "enabled-capture-options-native-mobile": ["web_camera", "mobile_camera", "upload"],
-                        "allow-file-upload": true,
-                        "liveness-required": false,
-                        "require-liveness": false,
-                        "cancel-button-enabled": true,
-                        "back-step-enabled": true,
-                        "image-capture-count": 5
-                    }
-                }
-            }
-        }
-    };
-    res.json(template);
-});
-
-app.get('/outlier/verifications', (req, res) => {
-    const clientInfo = getClientInfo(req);
-    const id = req.query._id;
-    if (!id) return res.status(400).json({ error: 'Missing _id parameter' });
-    
-    logUsage({
-        endpoint: '/outlier/verifications',
-        type: 'verification_check',
-        verificationId: id,
-        ...clientInfo
-    });
-
-    res.json({
-        userVerifications: [{
-            _id: id,
-            createdAt: new Date().toISOString(),
-            status: "inquiry.approved",
-            templateId: req.query.templateId || YOUR_TEMPLATE_ID,
-            inquiryId: req.query.inquiryId || YOUR_INQUIRY_ID,
-            internalFlags: [],
-            statusUpdatedAt: new Date().toISOString(),
-            personaAccountId: req.query.personaAccountId || YOUR_ACCOUNT_ID
-        }]
-    });
-});
-
-app.post('/outlier/verifications', (req, res) => {
-    const clientInfo = getClientInfo(req);
-    const id = req.body?._id;
-    if (!id) return res.status(400).json({ error: 'Missing _id in request body' });
-    
-    logUsage({
-        endpoint: '/outlier/verifications',
-        type: 'verification_check_post',
-        verificationId: id,
-        ...clientInfo
-    });
-
-    res.json({
-        userVerifications: [{
-            _id: id,
-            createdAt: new Date().toISOString(),
-            status: "inquiry.approved",
-            templateId: req.body?.templateId || YOUR_TEMPLATE_ID,
-            inquiryId: req.body?.inquiryId || YOUR_INQUIRY_ID,
-            internalFlags: [],
-            statusUpdatedAt: new Date().toISOString(),
-            personaAccountId: req.body?.personaAccountId || YOUR_ACCOUNT_ID
-        }]
-    });
-});
-
-app.get('/logs', (req, res) => {
-    try {
-        if (fs.existsSync(LOG_FILE)) {
-            const content = fs.readFileSync(LOG_FILE, 'utf8');
-            const logs = JSON.parse(content);
-            res.json({ count: logs.length, logs: logs.slice(-100) });
-        } else {
-            res.json({ count: 0, logs: [] });
-        }
-    } catch (error) {
-        res.status(500).json({ error: 'Failed to read logs' });
-    }
 });
 
 app.all('*', async (req, res) => {
-    if (['/health', '/logs', '/template', '/outlier/verifications'].includes(req.path)) {
+    if (req.path === '/health') {
         return;
     }
 
+    const targetHost = getTargetHost(req);
     const inquiryId = getInquiryId(req);
 
     if (req.url.includes('/inquiries') && req.method === 'PATCH') {
@@ -271,11 +191,11 @@ app.all('*', async (req, res) => {
         method: req.method,
         headers: {
             ...req.headers,
-            host: TARGET_HOST,
+            host: targetHost,
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
             'Accept-Encoding': 'identity'
         },
-        hostname: TARGET_HOST,
+        hostname: targetHost,
         path: req.url,
         port: 443,
         rejectUnauthorized: false,
@@ -329,6 +249,6 @@ app.all('*', async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-    console.log('Proxy server running on port ' + PORT);
-    console.log('Target: ' + TARGET_HOST);
+    console.log('Universal Persona Proxy server running on port ' + PORT);
+    console.log('Handles any Persona subdomain dynamically');
 });
