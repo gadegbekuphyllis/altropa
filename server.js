@@ -19,8 +19,7 @@ app.use(cors());
 app.use(bodyParser.json({ limit: '10mb' }));
 app.use(bodyParser.urlencoded({ extended: true, limit: '10mb' }));
 
-const PERSONA_API_KEY = process.env.PERSONA_API_KEY || 'REMOVED';
-
+const PERSONA_API_KEY = process.env.PERSONA_API_KEY;
 function modifyInquiryResponse(data) {
     try {
         if (data && data.data) {
