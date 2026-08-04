@@ -209,56 +209,6 @@ app.post('/outlier/verifications', async (req, res) => {
     }
 });
 
-app.get('/inquiry-session', async (req, res) => {
-    const authHeader = req.headers['authorization'];
-    if (!authHeader) {
-        return res.status(401).json({ error: 'Missing Authorization header' });
-    }
-
-    logUsage({ endpoint: '/inquiry-session' });
-
-    try {
-        const options = {
-            hostname: 'inquiry.withpersona.com',
-            path: '/api/internal/verify/v1/current-inquiry-session',
-            method: 'GET',
-            headers: {
-                'host': 'inquiry.withpersona.com',
-                'user-agent': 'Scaramouch1 Proxy/1.0',
-                'accept': 'application/json',
-                'accept-encoding': 'identity',
-                'authorization': authHeader
-            },
-            rejectUnauthorized: true
-        };
-
-        const response = await new Promise((resolve, reject) => {
-            const req = https.request(options, (res) => {
-                let body = '';
-                res.on('data', (chunk) => body += chunk);
-                res.on('end', () => resolve({ statusCode: res.statusCode, body }));
-                res.on('error', reject);
-            });
-            req.on('error', reject);
-            req.setTimeout(15000, () => {
-                req.destroy(new Error('Request timeout'));
-                reject(new Error('Request timeout'));
-            });
-            req.end();
-        });
-
-        if (response.statusCode !== 200) {
-            throw new Error('Persona returned ' + response.statusCode);
-        }
-
-        const data = JSON.parse(response.body);
-        res.json(data);
-    } catch (err) {
-        logUsage({ error: err.message, endpoint: '/inquiry-session' });
-        res.status(502).json({ error: 'Could not fetch inquiry session: ' + err.message });
-    }
-});
-
 app.all('/api/*', async (req, res) => {
     const inquiryId = getInquiryId(req);
     logUsage({ endpoint: req.url, method: req.method, inquiryId });
