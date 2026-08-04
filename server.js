@@ -238,17 +238,21 @@ app.all('/api/*', async (req, res) => {
         });
 
         proxyReq.on('error', (err) => {
+            logUsage({ error: err.message, stack: err.stack });
             if (!res.headersSent) {
                 res.status(502).json({ error: 'Upstream error: ' + err.message });
             }
         });
 
         if (body && Object.keys(body).length > 0) {
-            proxyReq.write(JSON.stringify(body));
+            const payload = JSON.stringify(body);
+            headers['content-length'] = Buffer.byteLength(payload);
+            proxyReq.write(payload);
         }
         proxyReq.end();
 
     } catch (e) {
+        logUsage({ error: e.message, stack: e.stack });
         if (!res.headersSent) {
             res.status(500).json({ error: 'Server error: ' + e.message });
         }
