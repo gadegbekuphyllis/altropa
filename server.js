@@ -192,7 +192,7 @@ app.post('/outlier/verifications', async (req, res) => {
         const inquiry = await fetchInquiryFromPersona(id, authHeader);
         res.json({
             userVerifications: [{
-                _id: inquiry.id,
+                _id: id,
                 createdAt: inquiry.attributes['created-at'],
                 status: 'inquiry.' + (inquiry.attributes.status || 'unknown').toLowerCase(),
                 verificationStatus: inquiry.attributes['verification-status'] || null,
