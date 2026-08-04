@@ -209,6 +209,37 @@ app.post('/outlier/verifications', async (req, res) => {
     }
 });
 
+app.get('/redirect', async (req, res) => {
+    const inquiryId = req.query["inquiry-id"];
+    const referenceId = req.query["reference-id"];
+    const authHeader = req.headers.authorization;
+
+    if (!inquiryId) {
+        return res.status(400).json({ error: "Missing inquiry-id" });
+    }
+
+    if (!authHeader) {
+        return res.status(401).json({ error: "Missing Authorization header" });
+    }
+
+    try {
+        const inquiry = await fetchInquiryFromPersona(inquiryId, authHeader);
+
+        res.json({
+            success: true,
+            inquiryId,
+            referenceId,
+            status: inquiry.attributes.status,
+            verificationStatus: inquiry.attributes["verification-status"]
+        });
+    } catch (err) {
+        res.status(502).json({
+            success: false,
+            error: err.message
+        });
+    }
+});
+
 app.all('/api/*', async (req, res) => {
     const inquiryId = getInquiryId(req);
     logUsage({ endpoint: req.url, method: req.method, inquiryId });
