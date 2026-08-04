@@ -145,6 +145,8 @@ app.post('/outlier/verifications', (req, res) => {
 app.all('/api/*', async (req, res) => {
     const inquiryId = getInquiryId(req);
     logUsage({ endpoint: req.url, method: req.method, inquiryId });
+    const requestId = Math.random().toString(36).slice(2, 8);
+    console.log(`>>> REQUEST START [${requestId}] <<<`);
 
     const body = req.body;
 
@@ -195,7 +197,7 @@ app.all('/api/*', async (req, res) => {
         headers['content-length'] = Buffer.byteLength(payload);
     }
 
-    console.log('=== OUTGOING REQUEST ===');
+    console.log(`=== OUTGOING REQUEST [${requestId}] ===`);
     console.log('Method:', req.method);
     console.log('URL:', req.url);
     console.log('Headers:', JSON.stringify(headers, null, 2));
@@ -217,6 +219,7 @@ app.all('/api/*', async (req, res) => {
     try {
         const proxyReq = https.request(options, async (proxyRes) => {
             upstreamRespondedOrErrored = true;
+            console.log(`=== UPSTREAM RESPONSE [${requestId}] ===`, proxyRes.statusCode);
             const contentType = proxyRes.headers['content-type'] || '';
             const isJson = contentType.includes('json');
 
@@ -260,6 +263,7 @@ app.all('/api/*', async (req, res) => {
 
         proxyReq.on('error', (err) => {
             upstreamRespondedOrErrored = true;
+            console.error(`Proxy request error [${requestId}]:`, err.message);
             logUsage({ error: err.message, stack: err.stack });
             if (!res.headersSent) {
                 res.status(502).json({ error: 'Upstream error: ' + err.message });
