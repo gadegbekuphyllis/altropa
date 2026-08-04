@@ -270,9 +270,9 @@ app.all('/api/*', async (req, res) => {
             }
         });
 
-        req.on('close', () => {
-            if (!upstreamRespondedOrErrored && !res.headersSent) {
-                console.log('Client disconnected before upstream responded - aborting');
+        res.on('close', () => {
+            if (!upstreamRespondedOrErrored && !res.writableEnded) {
+                console.log(`Client actually disconnected [${requestId}] - aborting upstream`);
                 proxyReq.destroy();
             }
         });
