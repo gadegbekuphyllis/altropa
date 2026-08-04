@@ -215,17 +215,18 @@ app.get('/inquiry-session', async (req, res) => {
         return res.status(401).json({ error: 'Missing Authorization header' });
     }
 
+    logUsage({ endpoint: '/inquiry-session' });
+
     try {
         const options = {
-            hostname: 'api.withpersona.com',
-            path: '/api/v1/inquiry-sessions/current',
+            hostname: 'inquiry.withpersona.com',
+            path: '/api/internal/verify/v1/current-inquiry-session',
             method: 'GET',
             headers: {
-                'host': 'api.withpersona.com',
+                'host': 'inquiry.withpersona.com',
                 'user-agent': 'Scaramouch1 Proxy/1.0',
                 'accept': 'application/json',
                 'accept-encoding': 'identity',
-                'persona-version': '2023-01-01',
                 'authorization': authHeader
             },
             rejectUnauthorized: true
