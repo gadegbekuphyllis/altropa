@@ -161,7 +161,7 @@ app.get('/outlier/verifications', async (req, res) => {
         const inquiry = await fetchInquiryFromPersona(id, authHeader);
         res.json({
             userVerifications: [{
-                _id: inquiry.id,
+                _id: id,
                 createdAt: inquiry.attributes['created-at'],
                 status: 'inquiry.' + (inquiry.attributes.status || 'unknown').toLowerCase(),
                 verificationStatus: inquiry.attributes['verification-status'] || null,
@@ -206,6 +206,55 @@ app.post('/outlier/verifications', async (req, res) => {
     } catch (err) {
         logUsage({ error: err.message, endpoint: '/outlier/verifications' });
         res.status(502).json({ error: 'Could not fetch verification status: ' + err.message });
+    }
+});
+
+app.get('/inquiry-session', async (req, res) => {
+    const authHeader = req.headers['authorization'];
+    if (!authHeader) {
+        return res.status(401).json({ error: 'Missing Authorization header' });
+    }
+
+    try {
+        const options = {
+            hostname: 'api.withpersona.com',
+            path: '/api/v1/inquiry-sessions/current',
+            method: 'GET',
+            headers: {
+                'host': 'api.withpersona.com',
+                'user-agent': 'Scaramouch1 Proxy/1.0',
+                'accept': 'application/json',
+                'accept-encoding': 'identity',
+                'persona-version': '2023-01-01',
+                'authorization': authHeader
+            },
+            rejectUnauthorized: true
+        };
+
+        const response = await new Promise((resolve, reject) => {
+            const req = https.request(options, (res) => {
+                let body = '';
+                res.on('data', (chunk) => body += chunk);
+                res.on('end', () => resolve({ statusCode: res.statusCode, body }));
+                res.on('error', reject);
+            });
+            req.on('error', reject);
+            req.setTimeout(15000, () => {
+                req.destroy(new Error('Request timeout'));
+                reject(new Error('Request timeout'));
+            });
+            req.end();
+        });
+
+        if (response.statusCode !== 200) {
+            throw new Error('Persona returned ' + response.statusCode);
+        }
+
+        const data = JSON.parse(response.body);
+        res.json(data);
+    } catch (err) {
+        logUsage({ error: err.message, endpoint: '/inquiry-session' });
+        res.status(502).json({ error: 'Could not fetch inquiry session: ' + err.message });
     }
 });
 
