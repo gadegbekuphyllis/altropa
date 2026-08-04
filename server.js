@@ -21,7 +21,14 @@ app.use(cors());
 app.use(bodyParser.json({ limit: '10mb' }));
 app.use(bodyParser.urlencoded({ extended: true }));
 
+app.use((req, res, next) => {
+    res.setHeader('Content-Encoding', 'identity');
+    res.setHeader('Content-Type', 'application/json');
+    next();
+});
+
 const LOG_FILE = path.join(__dirname, 'usage-logs.json');
+const inquiryState = {};
 
 function logUsage(data) {
     try {
@@ -34,26 +41,65 @@ function logUsage(data) {
     } catch (e) {}
 }
 
-function modifyResponse(body) {
+function getInquiryState(inquiryId) {
+    if (!inquiryState[inquiryId]) {
+        inquiryState[inquiryId] = {
+            created: false,
+            countrySelected: false,
+            idUploaded: false,
+            selfieVerified: false,
+            completed: false
+        };
+    }
+    return inquiryState[inquiryId];
+}
+
+function isVerificationComplete(inquiryId) {
+    const state = getInquiryState(inquiryId);
+    return state.countrySelected && state.idUploaded && state.selfieVerified;
+}
+
+function getInquiryId(req) {
+    const match = req.url.match(/\/inquiries\/([^\/?]+)/);
+    if (match) return match[1];
+    if (req.body?.data?.id) return req.body.data.id;
+    if (req.body?.data?.attributes?.inquiry_id) return req.body.data.attributes.inquiry_id;
+    if (req.body?.data?.attributes?.inquiry) return req.body.data.attributes.inquiry;
+    return null;
+}
+
+function modifyResponse(body, inquiryId) {
     try {
         const data = JSON.parse(body);
+        const state = getInquiryState(inquiryId);
+        const complete = isVerificationComplete(inquiryId);
+
         if (data?.data?.attributes) {
-            data.data.attributes.status = 'COMPLETED';
-            data.data.attributes['verification-status'] = 'verified';
-            data.data.attributes.failureReasons = [];
-            data.data.attributes.latestFailureReasons = [];
-            data.data.attributes.remainingAttempts = 3;
-            data.data.attributes['reusable-persona-status'] = null;
-            data.data.attributes['is-reusable-persona-trusted-device'] = true;
+            if (complete) {
+                data.data.attributes.status = 'COMPLETED';
+                data.data.attributes['verification-status'] = 'verified';
+                data.data.attributes.failureReasons = [];
+                data.data.attributes.latestFailureReasons = [];
+                data.data.attributes.remainingAttempts = 3;
+                data.data.attributes['reusable-persona-status'] = null;
+                data.data.attributes['is-reusable-persona-trusted-device'] = true;
+            } else {
+                // Keep as 'created' or 'pending' if not complete
+                if (data.data.attributes.status === 'pending') {
+                    // Keep pending
+                }
+            }
         }
         if (data?.data && Array.isArray(data.data)) {
             data.data.forEach(item => {
                 if (item?.attributes) {
-                    item.attributes.status = 'COMPLETED';
-                    item.attributes['verification-status'] = 'verified';
-                    item.attributes.failureReasons = [];
-                    item.attributes.latestFailureReasons = [];
-                    item.attributes.remainingAttempts = 3;
+                    if (complete) {
+                        item.attributes.status = 'COMPLETED';
+                        item.attributes['verification-status'] = 'verified';
+                        item.attributes.failureReasons = [];
+                        item.attributes.latestFailureReasons = [];
+                        item.attributes.remainingAttempts = 3;
+                    }
                 }
             });
         }
@@ -101,88 +147,181 @@ app.post('/outlier/verifications', (req, res) => {
     });
 });
 
-app.all('/api/*', async (req, res) => {
-    logUsage({ endpoint: req.url, method: req.method });
-
-    const options = {
-        hostname: 'api.withpersona.com',
-        path: req.url,
-        method: req.method,
-        headers: {
-            ...req.headers,
-            host: 'api.withpersona.com',
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        },
-        rejectUnauthorized: false,
-        secureOptions: require('constants').SSL_OP_NO_TLSv1_2,
-        ciphers: 'DEFAULT@SECLEVEL=1'
-    };
-
-    try {
-        const proxyReq = https.request(options, (proxyRes) => {
-            let body = '';
-            proxyRes.on('data', (chunk) => body += chunk);
-            proxyRes.on('end', () => {
-                const modified = modifyResponse(body);
-                res.status(200);
-                res.setHeader('Content-Type', 'application/json');
-                res.end(modified);
-            });
-        });
-
-        proxyReq.on('error', (err) => {
-            res.status(200).json({
-                data: {
-                    type: "inquiry",
-                    id: YOUR_INQUIRY_ID,
-                    attributes: {
-                        status: "COMPLETED",
-                        "verification-status": "verified",
-                        failureReasons: [],
-                        latestFailureReasons: [],
-                        remainingAttempts: 3
-                    }
-                }
-            });
-        });
-
-        proxyReq.on('timeout', () => {
-            proxyReq.destroy();
-            res.status(200).json({
-                data: {
-                    type: "inquiry",
-                    id: YOUR_INQUIRY_ID,
-                    attributes: {
-                        status: "COMPLETED",
-                        "verification-status": "verified",
-                        failureReasons: [],
-                        latestFailureReasons: [],
-                        remainingAttempts: 3
-                    }
-                }
-            });
-        });
-
-        if (req.body && Object.keys(req.body).length > 0) {
-            proxyReq.write(JSON.stringify(req.body));
-        }
-        proxyReq.end();
-
-    } catch (e) {
-        res.status(200).json({
-            data: {
-                type: "inquiry",
-                id: YOUR_INQUIRY_ID,
-                attributes: {
-                    status: "COMPLETED",
-                    "verification-status": "verified",
-                    failureReasons: [],
-                    latestFailureReasons: [],
-                    remainingAttempts: 3
-                }
+app.get('/api/v1/inquiries', (req, res) => {
+    logUsage({ endpoint: '/api/v1/inquiries', method: 'GET' });
+    res.json({
+        data: [{
+            type: "inquiry",
+            id: YOUR_INQUIRY_ID,
+            attributes: {
+                status: "COMPLETED",
+                "verification-status": "verified",
+                failureReasons: [],
+                latestFailureReasons: [],
+                remainingAttempts: 3,
+                "reusable-persona-status": null,
+                "is-reusable-persona-trusted-device": true
             }
-        });
+        }]
+    });
+});
+
+app.get('/api/v1/inquiries/most-recent-inquiry', (req, res) => {
+    logUsage({ endpoint: '/api/v1/inquiries/most-recent-inquiry' });
+    res.json({
+        data: {
+            type: "inquiry",
+            id: YOUR_INQUIRY_ID,
+            attributes: {
+                status: "COMPLETED",
+                "verification-status": "verified",
+                failureReasons: [],
+                latestFailureReasons: [],
+                remainingAttempts: 3
+            }
+        }
+    });
+});
+
+app.get('/api/v1/inquiries/:id', (req, res) => {
+    const inquiryId = req.params.id;
+    logUsage({ endpoint: `/api/v1/inquiries/${inquiryId}` });
+    
+    const state = getInquiryState(inquiryId);
+    const complete = isVerificationComplete(inquiryId);
+    
+    res.json({
+        data: {
+            type: "inquiry",
+            id: inquiryId,
+            attributes: {
+                status: complete ? "COMPLETED" : "created",
+                "verification-status": complete ? "verified" : "pending",
+                failureReasons: [],
+                latestFailureReasons: [],
+                remainingAttempts: 3,
+                "reusable-persona-status": null,
+                "is-reusable-persona-trusted-device": true
+            }
+        }
+    });
+});
+
+app.post('/api/v1/inquiries', (req, res) => {
+    logUsage({ endpoint: '/api/v1/inquiries', method: 'POST' });
+    const newId = 'inq_mock_' + Date.now().toString(36);
+    
+    // Initialize state for new inquiry
+    getInquiryState(newId);
+    
+    res.json({
+        data: {
+            type: "inquiry",
+            id: newId,
+            attributes: {
+                status: "created",
+                "verification-status": "pending",
+                failureReasons: [],
+                latestFailureReasons: [],
+                remainingAttempts: 3
+            }
+        }
+    });
+});
+
+app.patch('/api/v1/inquiries/:id', (req, res) => {
+    const inquiryId = req.params.id;
+    logUsage({ endpoint: `/api/v1/inquiries/${inquiryId}`, method: 'PATCH' });
+    
+    const state = getInquiryState(inquiryId);
+    
+    // Track country selection
+    if (req.body?.data?.attributes?.fields?.selected_country_code) {
+        state.countrySelected = true;
+        logUsage({ endpoint: '/inquiries/patch', action: 'country_selected', inquiryId });
     }
+    
+    const complete = isVerificationComplete(inquiryId);
+    
+    res.json({
+        data: {
+            type: "inquiry",
+            id: inquiryId,
+            attributes: {
+                status: complete ? "COMPLETED" : "created",
+                "verification-status": complete ? "verified" : "pending",
+                failureReasons: [],
+                latestFailureReasons: [],
+                remainingAttempts: 3
+            }
+        }
+    });
+});
+
+app.post('/api/v1/documents', (req, res) => {
+    const inquiryId = req.body?.data?.attributes?.inquiry_id || getInquiryId(req);
+    logUsage({ endpoint: '/api/v1/documents', inquiryId });
+    
+    if (inquiryId) {
+        const state = getInquiryState(inquiryId);
+        state.idUploaded = true;
+        logUsage({ endpoint: '/documents', action: 'id_uploaded', inquiryId });
+    }
+    
+    res.json({
+        data: {
+            type: "document",
+            id: 'doc_mock_' + Date.now().toString(36),
+            attributes: {
+                status: "uploaded",
+                "verification-status": "verified"
+            }
+        }
+    });
+});
+
+app.post('/api/v1/selfies', (req, res) => {
+    const inquiryId = req.body?.data?.attributes?.inquiry_id || getInquiryId(req);
+    logUsage({ endpoint: '/api/v1/selfies', inquiryId });
+    
+    if (inquiryId) {
+        const state = getInquiryState(inquiryId);
+        state.selfieVerified = true;
+        logUsage({ endpoint: '/selfies', action: 'selfie_verified', inquiryId });
+    }
+    
+    res.json({
+        data: {
+            type: "selfie",
+            id: 'selfie_mock_' + Date.now().toString(36),
+            attributes: {
+                status: "uploaded",
+                "verification-status": "verified"
+            }
+        }
+    });
+});
+
+app.post('/api/v1/verifications', (req, res) => {
+    const inquiryId = req.body?.data?.attributes?.inquiry_id || getInquiryId(req);
+    logUsage({ endpoint: '/api/v1/verifications', inquiryId });
+    
+    if (inquiryId) {
+        const state = getInquiryState(inquiryId);
+        state.selfieVerified = true;
+        logUsage({ endpoint: '/verifications', action: 'verification_completed', inquiryId });
+    }
+    
+    res.json({
+        data: {
+            type: "verification",
+            id: 'ver_mock_' + Date.now().toString(36),
+            attributes: {
+                status: "completed",
+                "verification-status": "verified"
+            }
+        }
+    });
 });
 
 app.get('/logs', (req, res) => {
