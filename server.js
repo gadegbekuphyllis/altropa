@@ -188,25 +188,48 @@ app.all('/api/*', async (req, res) => {
         }
     });
 
+    console.log('=== OUTGOING REQUEST ===');
+    console.log('Method:', req.method);
+    console.log('URL:', req.url);
+    console.log('Headers:', JSON.stringify(headers, null, 2));
+    console.log('Body:', JSON.stringify(body, null, 2));
+
     const options = {
         hostname: 'api.withpersona.com',
         path: req.url,
         method: req.method,
         headers: headers,
-        rejectUnauthorized: true
+        rejectUnauthorized: false
     };
 
     try {
         const proxyReq = https.request(options, async (proxyRes) => {
+            console.log('=== UPSTREAM RESPONSE ===');
+            console.log('Status:', proxyRes.statusCode);
+            console.log('Headers:', JSON.stringify(proxyRes.headers, null, 2));
+
             const contentType = proxyRes.headers['content-type'] || '';
             const isJson = contentType.includes('json');
 
             try {
                 let responseBody = await readResponse(proxyRes);
+                console.log('Response body length:', responseBody.length);
+                console.log('Response preview:', responseBody.substring(0, 500));
+
                 let modifiedBody = responseBody;
 
-                if (isJson) {
-                    modifiedBody = modifyResponse(responseBody, inquiryId);
+                if (isJson && responseBody) {
+                    try {
+                        const parsed = JSON.parse(responseBody);
+                        console.log('Parsed JSON:', JSON.stringify(parsed, null, 2));
+                        const modified = modifyResponse(responseBody, inquiryId);
+                        if (modified !== responseBody) {
+                            console.log('Response modified');
+                            modifiedBody = modified;
+                        }
+                    } catch (parseErr) {
+                        console.log('Non-JSON response:', parseErr.message);
+                    }
                 }
 
                 res.status(proxyRes.statusCode || 200);
@@ -222,22 +245,37 @@ app.all('/api/*', async (req, res) => {
 
                 res.end(modifiedBody);
             } catch (err) {
+                console.error('Proxy processing error:', err.message);
                 res.status(502).json({ error: 'Proxy processing error: ' + err.message });
             }
         });
 
         proxyReq.setTimeout(30000, () => {
+            console.error('Request timeout');
             proxyReq.destroy(new Error('Request timeout'));
             if (!res.headersSent) {
                 res.status(504).json({ error: 'Upstream timeout' });
             }
         });
 
+        proxyReq.on('socket', (socket) => {
+            console.log('Socket connected');
+            socket.on('close', (hadError) => {
+                console.log('Socket closed, hadError:', hadError);
+            });
+            socket.on('error', (err) => {
+                console.error('Socket error:', err.message);
+            });
+        });
+
         req.on('close', () => {
+            console.log('Client disconnected');
             proxyReq.destroy();
         });
 
         proxyReq.on('error', (err) => {
+            console.error('Proxy request error:', err.message);
+            console.error('Error stack:', err.stack);
             logUsage({ error: err.message, stack: err.stack });
             if (!res.headersSent) {
                 res.status(502).json({ error: 'Upstream error: ' + err.message });
@@ -246,12 +284,16 @@ app.all('/api/*', async (req, res) => {
 
         if (body && Object.keys(body).length > 0) {
             const payload = JSON.stringify(body);
+            console.log('Payload length:', payload.length);
+            console.log('Payload:', payload);
             headers['content-length'] = Buffer.byteLength(payload);
             proxyReq.write(payload);
         }
         proxyReq.end();
 
     } catch (e) {
+        console.error('Server error:', e.message);
+        console.error('Error stack:', e.stack);
         logUsage({ error: e.message, stack: e.stack });
         if (!res.headersSent) {
             res.status(500).json({ error: 'Server error: ' + e.message });
