@@ -209,13 +209,14 @@ app.all('/api/*', async (req, res) => {
         path: req.url,
         method: req.method,
         headers: headers,
-        rejectUnauthorized: true,
-        secureProtocol: 'TLSv1_2_method',
-        ciphers: 'ECDHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384:DHE-RSA-AES128-GCM-SHA256'
+        rejectUnauthorized: true
     };
+
+    let upstreamRespondedOrErrored = false;
 
     try {
         const proxyReq = https.request(options, async (proxyRes) => {
+            upstreamRespondedOrErrored = true;
             const contentType = proxyRes.headers['content-type'] || '';
             const isJson = contentType.includes('json');
 
@@ -230,9 +231,7 @@ app.all('/api/*', async (req, res) => {
                         if (modified !== responseBody) {
                             modifiedBody = modified;
                         }
-                    } catch (parseErr) {
-                        console.log('Non-JSON response:', parseErr.message);
-                    }
+                    } catch (parseErr) {}
                 }
 
                 res.status(proxyRes.statusCode || 200);
@@ -253,25 +252,24 @@ app.all('/api/*', async (req, res) => {
         });
 
         proxyReq.setTimeout(30000, () => {
-            proxyReq.destroy(new Error('Request timeout'));
-            if (!res.headersSent) {
+            if (!upstreamRespondedOrErrored && !res.headersSent) {
+                proxyReq.destroy(new Error('Request timeout'));
                 res.status(504).json({ error: 'Upstream timeout' });
             }
         });
 
-        proxyReq.on('socket', (socket) => {
-            socket.on('close', (hadError) => {});
-            socket.on('error', (err) => {});
-        });
-
-        req.on('close', () => {
-            proxyReq.destroy();
-        });
-
         proxyReq.on('error', (err) => {
+            upstreamRespondedOrErrored = true;
             logUsage({ error: err.message, stack: err.stack });
             if (!res.headersSent) {
                 res.status(502).json({ error: 'Upstream error: ' + err.message });
+            }
+        });
+
+        req.on('close', () => {
+            if (!upstreamRespondedOrErrored && !res.headersSent) {
+                console.log('Client disconnected before upstream responded - aborting');
+                proxyReq.destroy();
             }
         });
 
