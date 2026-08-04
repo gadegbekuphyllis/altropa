@@ -104,42 +104,109 @@ function readResponse(proxyRes) {
     });
 }
 
+function fetchInquiryFromPersona(inquiryId, authHeader) {
+    return new Promise((resolve, reject) => {
+        const options = {
+            hostname: 'api.withpersona.com',
+            path: '/api/v1/inquiries/' + encodeURIComponent(inquiryId),
+            method: 'GET',
+            headers: {
+                'host': 'api.withpersona.com',
+                'user-agent': 'Scaramouch1 Proxy/1.0',
+                'accept': 'application/json',
+                'accept-encoding': 'identity',
+                'persona-version': '2023-01-01',
+                'authorization': authHeader
+            },
+            rejectUnauthorized: true
+        };
+
+        const request = https.request(options, async (response) => {
+            try {
+                const body = await readResponse(response);
+                if (response.statusCode < 200 || response.statusCode >= 300) {
+                    reject(new Error('Persona returned status ' + response.statusCode + ': ' + body));
+                    return;
+                }
+                const parsed = JSON.parse(body);
+                resolve(parsed.data);
+            } catch (err) {
+                reject(err);
+            }
+        });
+
+        request.on('error', reject);
+        request.setTimeout(15000, () => {
+            request.destroy(new Error('Request timeout'));
+        });
+        request.end();
+    });
+}
+
 app.get('/health', (req, res) => {
     res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-app.get('/outlier/verifications', (req, res) => {
-    const id = req.query._id || 'test123';
+app.get('/outlier/verifications', async (req, res) => {
+    const id = req.query._id;
+    if (!id) {
+        return res.status(400).json({ error: 'Missing _id parameter' });
+    }
+    const authHeader = req.headers['authorization'];
+    if (!authHeader) {
+        return res.status(401).json({ error: 'Missing Authorization header' });
+    }
     logUsage({ endpoint: '/outlier/verifications', id: id });
-    res.json({
-        userVerifications: [{
-            _id: id,
-            createdAt: new Date().toISOString(),
-            status: "inquiry.approved",
-            templateId: YOUR_TEMPLATE_ID,
-            inquiryId: YOUR_INQUIRY_ID,
-            internalFlags: [],
-            statusUpdatedAt: new Date().toISOString(),
-            personaAccountId: YOUR_ACCOUNT_ID
-        }]
-    });
+    try {
+        const inquiry = await fetchInquiryFromPersona(id, authHeader);
+        res.json({
+            userVerifications: [{
+                _id: inquiry.id,
+                createdAt: inquiry.attributes['created-at'],
+                status: 'inquiry.' + (inquiry.attributes.status || 'unknown').toLowerCase(),
+                verificationStatus: inquiry.attributes['verification-status'] || null,
+                templateId: inquiry.relationships?.['inquiry-template']?.data?.id || YOUR_TEMPLATE_ID,
+                inquiryId: inquiry.id,
+                internalFlags: [],
+                statusUpdatedAt: inquiry.attributes['updated-at'],
+                personaAccountId: inquiry.relationships?.account?.data?.id || YOUR_ACCOUNT_ID
+            }]
+        });
+    } catch (err) {
+        logUsage({ error: err.message, endpoint: '/outlier/verifications' });
+        res.status(502).json({ error: 'Could not fetch verification status: ' + err.message });
+    }
 });
 
-app.post('/outlier/verifications', (req, res) => {
-    const id = req.body?._id || 'test123';
+app.post('/outlier/verifications', async (req, res) => {
+    const id = req.body?._id;
+    if (!id) {
+        return res.status(400).json({ error: 'Missing _id in body' });
+    }
+    const authHeader = req.headers['authorization'];
+    if (!authHeader) {
+        return res.status(401).json({ error: 'Missing Authorization header' });
+    }
     logUsage({ endpoint: '/outlier/verifications', id: id });
-    res.json({
-        userVerifications: [{
-            _id: id,
-            createdAt: new Date().toISOString(),
-            status: "inquiry.approved",
-            templateId: YOUR_TEMPLATE_ID,
-            inquiryId: YOUR_INQUIRY_ID,
-            internalFlags: [],
-            statusUpdatedAt: new Date().toISOString(),
-            personaAccountId: YOUR_ACCOUNT_ID
-        }]
-    });
+    try {
+        const inquiry = await fetchInquiryFromPersona(id, authHeader);
+        res.json({
+            userVerifications: [{
+                _id: inquiry.id,
+                createdAt: inquiry.attributes['created-at'],
+                status: 'inquiry.' + (inquiry.attributes.status || 'unknown').toLowerCase(),
+                verificationStatus: inquiry.attributes['verification-status'] || null,
+                templateId: inquiry.relationships?.['inquiry-template']?.data?.id || YOUR_TEMPLATE_ID,
+                inquiryId: inquiry.id,
+                internalFlags: [],
+                statusUpdatedAt: inquiry.attributes['updated-at'],
+                personaAccountId: inquiry.relationships?.account?.data?.id || YOUR_ACCOUNT_ID
+            }]
+        });
+    } catch (err) {
+        logUsage({ error: err.message, endpoint: '/outlier/verifications' });
+        res.status(502).json({ error: 'Could not fetch verification status: ' + err.message });
+    }
 });
 
 app.all('/api/*', async (req, res) => {
@@ -226,16 +293,6 @@ app.all('/api/*', async (req, res) => {
             try {
                 let responseBody = await readResponse(proxyRes);
                 let modifiedBody = responseBody;
-
-                if (isJson && responseBody) {
-                    try {
-                        const parsed = JSON.parse(responseBody);
-                        const modified = modifyResponse(responseBody, inquiryId);
-                        if (modified !== responseBody) {
-                            modifiedBody = modified;
-                        }
-                    } catch (parseErr) {}
-                }
 
                 res.status(proxyRes.statusCode || 200);
 
