@@ -50,25 +50,41 @@ function logUsage(data) {
 
 function verifyWebhookSignature(req, rawBody) {
     const signature = req.headers['persona-signature'];
+
     if (!signature) {
         console.error('Missing persona-signature header');
         return false;
     }
-    
+
     try {
         const hmac = crypto.createHmac('sha256', WEBHOOK_SECRET);
         hmac.update(rawBody);
+
         const computed = hmac.digest('base64');
-        
+
+        const computedBuffer = Buffer.from(computed);
+        const signatureBuffer = Buffer.from(signature);
+
+        if (computedBuffer.length !== signatureBuffer.length) {
+            console.error(
+                'Signature length mismatch:',
+                computedBuffer.length,
+                signatureBuffer.length
+            );
+            return false;
+        }
+
         const isValid = crypto.timingSafeEqual(
-            Buffer.from(computed), 
-            Buffer.from(signature)
+            computedBuffer,
+            signatureBuffer
         );
-        
-        console.log('Signature verification:', isValid ? 'VALID' : 'INVALID');
+
+        console.log('Webhook signature valid:', isValid);
+
         return isValid;
-    } catch (error) {
-        console.error('Signature verification error:', error);
+
+    } catch (err) {
+        console.error('Signature verification error:', err);
         return false;
     }
 }
@@ -231,28 +247,43 @@ app.post('/api/start-verification', async (req, res) => {
 });
 
 app.post('/api/webhook', async (req, res) => {
-    const rawBody = req.rawBody;
-    
+
+    const rawBody = req.body;
+
     if (!verifyWebhookSignature(req, rawBody)) {
         console.error('Invalid webhook signature');
-        return res.status(401).json({ error: 'Invalid signature' });
+        return res.status(401).json({
+            error: 'Invalid signature'
+        });
     }
 
-    const body = req.body;
-    logUsage({ endpoint: '/api/webhook', eventType: body.type });
+    const body = JSON.parse(rawBody.toString());
+
+    logUsage({
+        endpoint: '/api/webhook',
+        eventType: body.type
+    });
 
     const inquiryId = body.data?.id;
     const status = body.data?.attributes?.status;
     const referenceId = body.data?.attributes?.['reference-id'];
-    const verificationStatus = body.data?.attributes?.['verification-status'];
-    const accountId = body.data?.relationships?.account?.data?.id;
+    const verificationStatus =
+        body.data?.attributes?.['verification-status'];
+
+    const accountId =
+        body.data?.relationships?.account?.data?.id;
 
     if (!inquiryId) {
-        return res.status(400).json({ error: 'Missing inquiry ID' });
+        return res.status(400).json({
+            error: 'Missing inquiry ID'
+        });
     }
 
     try {
-        console.log(`Verification ${status} for inquiry ${inquiryId}, reference: ${referenceId}`);
+
+        console.log(
+            `Verification ${status} for inquiry ${inquiryId}`
+        );
 
         const { data: existingVerification } = await supabase
             .from('verifications')
@@ -260,34 +291,46 @@ app.post('/api/webhook', async (req, res) => {
             .eq('inquiry_id', inquiryId)
             .single();
 
+
         const { error: upsertError } = await supabase
             .from('verifications')
             .upsert({
                 inquiry_id: inquiryId,
                 reference_id: referenceId,
-                user_id: existingVerification?.user_id,
+                user_id: existingVerification?.user_id || null,
                 status: status,
                 verification_status: verificationStatus,
                 persona_account_id: accountId,
                 webhook_data: body,
                 updated_at: new Date().toISOString()
             }, {
-                onConflict: 'inquiry_id'
+                onConflict: ' inquiry_id'
             });
 
+
         if (upsertError) {
-            console.error('Supabase upsert error:', upsertError);
+            console.error(
+                'Supabase upsert error:',
+                upsertError
+            );
         }
 
-        res.json({
-            success: true,
-            message: 'Webhook received'
+
+        return res.json({
+            success:true,
+            message:'Webhook received'
         });
 
-    } catch (err) {
-        console.error('Webhook processing error:', err);
-        res.status(500).json({
-            error: 'Webhook processing failed'
+
+    } catch(err) {
+
+        console.error(
+            'Webhook processing error:',
+            err
+        );
+
+        return res.status(500).json({
+            error:'Webhook processing failed'
         });
     }
 });
