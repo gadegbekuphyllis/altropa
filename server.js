@@ -137,6 +137,147 @@ function verifyWebhookSignature(req, rawBody) {
     }
 }
 
+
+function isTerminalPersonaStatus(status) {
+    if (!status) return false;
+    const s = status.toLowerCase();
+    return ['completed', 'approved', 'declined', 'failed', 'expired'].includes(s);
+}
+
+function fetchInquiryFromPersona(inquiryId) {
+    return new Promise((resolve, reject) => {
+        const options = {
+            hostname: 'api.withpersona.com',
+            path: '/api/v1/inquiries/' + inquiryId,
+            method: 'GET',
+            headers: {
+                'Authorization': 'Bearer ' + PERSONA_API_KEY,
+                'Persona-Version': '2023-01-01'
+            }
+        };
+
+        const request = https.request(options, (response) => {
+            let body = '';
+            response.on('data', chunk => body += chunk);
+            response.on('end', () => resolve({ statusCode: response.statusCode, body }));
+        });
+        request.on('error', reject);
+        request.end();
+    });
+}
+
+
+async function refreshVerificationFromPersona(verification) {
+    if (!verification || !verification.inquiry_id) return null;
+
+    let response;
+    try {
+        response = await fetchInquiryFromPersona(verification.inquiry_id);
+    } catch (err) {
+        console.error('Persona refresh request failed:', err);
+        return null;
+    }
+
+    if (response.statusCode !== 200) {
+        console.error('Persona refresh failed:', response.statusCode, response.body);
+        return null;
+    }
+
+    let parsed;
+    try {
+        parsed = JSON.parse(response.body);
+    } catch (err) {
+        console.error('Persona refresh parse failed:', err);
+        return null;
+    }
+
+    const inquiry = parsed.data;
+    const status = inquiry.attributes?.status || verification.status;
+    const verificationStatus = inquiry.attributes?.['verification-status'] || null;
+    const accountId = inquiry.relationships?.account?.data?.id || null;
+
+    const { error: updateError } = await supabase
+        .from('verifications')
+        .update({
+            status: status,
+            verification_status: verificationStatus,
+            persona_account_id: accountId || undefined,
+            updated_at: new Date().toISOString()
+        })
+        .eq('id', verification.id);
+
+    if (updateError) {
+        console.error('Supabase refresh update error:', updateError);
+    }
+
+    return {
+        ...verification,
+        status,
+        verification_status: verificationStatus,
+        persona_account_id: accountId || verification.persona_account_id,
+        updated_at: new Date().toISOString()
+    };
+}
+
+
+function createRateLimiter({ windowMs, max }) {
+    const hits = new Map(); 
+    setInterval(() => {
+        const now = Date.now();
+        for (const [key, timestamps] of hits.entries()) {
+            const fresh = timestamps.filter(t => now - t < windowMs);
+            if (fresh.length === 0) {
+                hits.delete(key);
+            } else {
+                hits.set(key, fresh);
+            }
+        }
+    }, windowMs).unref();
+
+    return function rateLimit(key) {
+        const now = Date.now();
+        const timestamps = (hits.get(key) || []).filter(t => now - t < windowMs);
+
+        if (timestamps.length >= max) {
+            const retryAfterMs = windowMs - (now - timestamps[0]);
+            return { limited: true, retryAfterSeconds: Math.ceil(retryAfterMs / 1000) };
+        }
+
+        timestamps.push(now);
+        hits.set(key, timestamps);
+        return { limited: false };
+    };
+}
+
+const checkIpRateLimit = createRateLimiter({ windowMs: 10 * 60 * 1000, max: 5 });
+const checkUserRateLimit = createRateLimiter({ windowMs: 10 * 60 * 1000, max: 3 });
+
+function startVerificationRateLimiter(req, res, next) {
+    const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket.remoteAddress || 'unknown';
+    const userId = req.body?.userId || 'unknown';
+
+    const ipResult = checkIpRateLimit(`ip:${ip}`);
+    if (ipResult.limited) {
+        res.set('Retry-After', String(ipResult.retryAfterSeconds));
+        return res.status(429).json({
+            error: 'Too many verification attempts from this address. Please try again later.',
+            retryAfterSeconds: ipResult.retryAfterSeconds
+        });
+    }
+
+    const userResult = checkUserRateLimit(`user:${userId}`);
+    if (userResult.limited) {
+        res.set('Retry-After', String(userResult.retryAfterSeconds));
+        return res.status(429).json({
+            error: 'Too many verification attempts for this account. Please try again later.',
+            retryAfterSeconds: userResult.retryAfterSeconds
+        });
+    }
+
+    next();
+}
+
+
 app.get('/internal/persona/most-recent-inquiry', async (req, res) => {
 
     const userId = req.query._id;
@@ -150,7 +291,7 @@ app.get('/internal/persona/most-recent-inquiry', async (req, res) => {
 
     try {
 
-        const { data: inquiry, error } = await supabase
+        let { data: inquiry, error } = await supabase
             .from('verifications')
             .select('*')
             .eq('user_id', userId)
@@ -186,6 +327,12 @@ app.get('/internal/persona/most-recent-inquiry', async (req, res) => {
 
         }
 
+        if (!isTerminalPersonaStatus(inquiry.status)) {
+            const refreshed = await refreshVerificationFromPersona(inquiry);
+            if (refreshed) {
+                inquiry = refreshed;
+            }
+        }
 
 
         let status = "CREATED";
@@ -270,6 +417,12 @@ app.get('/internal/worker/verifications', async (req, res) => {
 
 
         if (verifications && verifications.length > 0) {
+            if (!isTerminalPersonaStatus(verifications[0].status)) {
+                const refreshed = await refreshVerificationFromPersona(verifications[0]);
+                if (refreshed) {
+                    verifications[0] = refreshed;
+                }
+            }
 
             const userVerifications = verifications.map(v => ({
                 _id: v.user_id,
@@ -312,7 +465,7 @@ app.get('/health', (req, res) =>
 
 });
 
-app.post('/api/start-verification', async (req, res) => {
+app.post('/api/start-verification', startVerificationRateLimiter, async (req, res) => {
 
     const {
         referenceId,
@@ -545,7 +698,6 @@ app.post('/api/webhook', async (req, res) => {
         eventType: body.type
     });
 
-
     const inquiryPayload = body.data?.attributes?.payload?.data;
 
     const inquiryId = inquiryPayload?.id;
@@ -587,7 +739,9 @@ app.post('/api/webhook', async (req, res) => {
         const { data: existingVerification } =
             await supabase
             .from('verifications')
-            .select('user_id, reference_id, persona_account_id')
+            .select(
+                'user_id, reference_id, persona_account_id'
+            )
             .eq(
                 'inquiry_id',
                 inquiryId
@@ -722,53 +876,14 @@ app.get('/api/verification-status', async (req, res) => {
                 });
             }
 
-            const options = {
-                hostname: 'api.withpersona.com',
-                path: '/api/v1/inquiries/' + verification.inquiry_id,
-                method: 'GET',
-                headers: {
-                    'Authorization': 'Bearer ' + PERSONA_API_KEY,
-                    'Persona-Version': '2023-01-01'
-                }
-            };
+            const refreshed = await refreshVerificationFromPersona(verification);
 
-            const response = await new Promise((resolve, reject) => {
-                const req = https.request(options, (res) => {
-                    let body = '';
-                    res.on('data', (chunk) => body += chunk);
-                    res.on('end', () => resolve({ statusCode: res.statusCode, body }));
-                    res.on('error', reject);
-                });
-                req.on('error', reject);
-                req.end();
-            });
-
-            if (response.statusCode !== 200) {
-                return res.status(response.statusCode).json({
-                    error: 'Persona API error',
-                    details: response.body
-                });
+            if (!refreshed) {
+                return res.status(502).json({ error: 'Persona API error' });
             }
 
-            const parsed = JSON.parse(response.body);
-            const inquiry = parsed.data;
-            const status = inquiry.attributes?.status || 'unknown';
-            const inquiryVerificationStatus = inquiry.attributes?.['verification-status'] || null;
-            const accountId = inquiry.relationships?.account?.data?.id || null;
-
-            const { error: updateError } = await supabase
-                .from('verifications')
-                .update({
-                    status: status,
-                    verification_status: inquiryVerificationStatus,
-                    persona_account_id: accountId || undefined,
-                    updated_at: new Date().toISOString()
-                })
-                .eq('id', verification.id);
-
-            if (updateError) {
-                console.error('Supabase update error:', updateError);
-            }
+            const status = refreshed.status;
+            const inquiryVerificationStatus = refreshed.verification_status;
 
             return res.json({
                 _id: verification.user_id,
