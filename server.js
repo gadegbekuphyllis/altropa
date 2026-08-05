@@ -477,8 +477,11 @@ async function getVerificationStatusForUser(userId) {
     }
 }
 
+const ALLOWED_EXTENSION_IDS = new Set([
+    'lmifennglkmmanneighhdeopefefiaom',
+]);
 
-app.post('/auth/session', (req, res) => {
+app.post('/auth/session', requireAuthenticatedUser, (req, res) => {
     const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket.remoteAddress || 'unknown';
 
     const ipResult = checkSessionIpRateLimit(`ip:${ip}`);
@@ -491,14 +494,19 @@ app.post('/auth/session', (req, res) => {
     }
 
     const { extensionId } = req.body;
+    const userId = req.authenticatedUserId;
 
     if (!isValidExtensionId(extensionId)) {
         return res.status(400).json({ error: 'Missing or invalid extensionId' });
     }
 
-    const token = issueSessionToken(extensionId);
+    if (!ALLOWED_EXTENSION_IDS.has(extensionId)) {
+        return res.status(403).json({ error: 'Unknown extension' });
+    }
 
-    logUsage({ endpoint: '/auth/session', extensionId });
+    const token = issueSessionToken(extensionId, userId);
+
+    logUsage({ endpoint: '/auth/session', extensionId, userId });
 
     return res.json({
         token,
@@ -507,7 +515,8 @@ app.post('/auth/session', (req, res) => {
 });
 
 app.post('/api/extension', extensionAuthMiddleware, async (req, res) => {
-    const { action, userId, referenceId, redirectUri } = req.body;
+    const { action, referenceId, redirectUri } = req.body;
+    const userId = req.sessionUserId;
 
     logUsage({ endpoint: '/api/extension', action, extensionId: req.extensionId, userId });
 
