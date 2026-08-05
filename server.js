@@ -2,18 +2,32 @@ const express = require('express');
 const cors = require('cors');
 const bodyParser = require('body-parser');
 const https = require('https');
+const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
+const { createClient } = require('@supabase/supabase-js');
 require("dotenv").config();
 
 const app = express();
 
 const PERSONA_API_KEY = process.env.PERSONA_API_KEY;
+const TEMPLATE_ID = process.env.TEMPLATE_ID;
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
-if (!PERSONA_API_KEY) {
-    console.error('Missing PERSONA_API_KEY environment variable');
+if (!PERSONA_API_KEY || !TEMPLATE_ID || !WEBHOOK_SECRET || !SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+    console.error('Missing required environment variables');
     process.exit(1);
 }
+
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+
+app.use('/api/webhook', bodyParser.json({
+    verify: (req, res, buf) => {
+        req.rawBody = buf.toString();
+    }
+}));
 
 app.use(cors());
 app.use(bodyParser.json({ limit: '10mb' }));
@@ -29,224 +43,350 @@ function logUsage(data) {
         }
         logs.push({ ...data, timestamp: new Date().toISOString() });
         fs.writeFileSync(LOG_FILE, JSON.stringify(logs, null, 2));
-    } catch (e) {}
-}
-
-function readResponse(proxyRes) {
-    return new Promise((resolve, reject) => {
-        let body = '';
-        proxyRes.on('data', (chunk) => body += chunk);
-        proxyRes.on('end', () => resolve(body));
-        proxyRes.on('error', reject);
-    });
-}
-
-// Create inquiry - PRODUCTION, real Persona API
-app.post('/api/v1/inquiries', async (req, res) => {
-    const templateId = req.body?.data?.attributes?.['template-id'];
-    
-    if (!templateId) {
-        return res.status(400).json({ error: 'template-id is required' });
+    } catch (e) {
+        console.error('Logging error:', e);
     }
+}
 
-    logUsage({ endpoint: '/api/v1/inquiries', templateId: templateId });
+function verifyWebhookSignature(req, rawBody) {
+    const signature = req.headers['persona-signature'];
+    if (!signature) {
+        console.error('Missing persona-signature header');
+        return false;
+    }
+    
+    try {
+        const hmac = crypto.createHmac('sha256', WEBHOOK_SECRET);
+        hmac.update(rawBody);
+        const computed = hmac.digest('base64');
+        
+        const isValid = crypto.timingSafeEqual(
+            Buffer.from(computed), 
+            Buffer.from(signature)
+        );
+        
+        console.log('Signature verification:', isValid ? 'VALID' : 'INVALID');
+        return isValid;
+    } catch (error) {
+        console.error('Signature verification error:', error);
+        return false;
+    }
+}
 
-    const data = JSON.stringify({
-        data: {
-            attributes: {
-                "template-id": templateId,
-                "redirect-uri": "https://scaramouch1.onrender.com/redirect"
-            }
-        }
-    });
-
-    const options = {
-        hostname: 'api.withpersona.com',
-        path: '/api/v1/inquiries',
-        method: 'POST',
-        headers: {
-            'Authorization': 'Bearer ' + PERSONA_API_KEY,
-            'Content-Type': 'application/json',
-            'Content-Length': Buffer.byteLength(data),
-            'Persona-Version': '2023-01-01'
-        }
-    };
-
-    const proxyReq = https.request(options, (proxyRes) => {
-        let body = '';
-        proxyRes.on('data', (chunk) => body += chunk);
-        proxyRes.on('end', () => {
-            // Return Persona's real response
-            res.status(proxyRes.statusCode);
-            res.setHeader('Content-Type', 'application/json');
-            res.end(body);
-        });
-    });
-
-    proxyReq.on('error', (err) => {
-        console.error('Proxy error:', err);
-        res.status(502).json({
-            error: 'Unable to reach Persona API',
-            details: err.message
-        });
-    });
-
-    proxyReq.write(data);
-    proxyReq.end();
-});
-
-// Get inquiry - PRODUCTION, real Persona API
-app.get('/api/v1/inquiries/:id', async (req, res) => {
-    const inquiryId = req.params.id;
-
-    const options = {
-        hostname: 'api.withpersona.com',
-        path: '/api/v1/inquiries/' + inquiryId,
-        method: 'GET',
-        headers: {
-            'Authorization': 'Bearer ' + PERSONA_API_KEY,
-            'Persona-Version': '2023-01-01'
-        }
-    };
-
-    const proxyReq = https.request(options, (proxyRes) => {
-        let body = '';
-        proxyRes.on('data', (chunk) => body += chunk);
-        proxyRes.on('end', () => {
-            res.status(proxyRes.statusCode);
-            res.setHeader('Content-Type', 'application/json');
-            res.end(body);
-        });
-    });
-
-    proxyReq.on('error', (err) => {
-        res.status(502).json({
-            error: 'Unable to reach Persona API',
-            details: err.message
-        });
-    });
-
-    proxyReq.end();
-});
-
-// List inquiries - PRODUCTION, real Persona API
-app.get('/api/v1/inquiries', async (req, res) => {
-    const options = {
-        hostname: 'api.withpersona.com',
-        path: '/api/v1/inquiries',
-        method: 'GET',
-        headers: {
-            'Authorization': 'Bearer ' + PERSONA_API_KEY,
-            'Persona-Version': '2023-01-01'
-        }
-    };
-
-    const proxyReq = https.request(options, (proxyRes) => {
-        let body = '';
-        proxyRes.on('data', (chunk) => body += chunk);
-        proxyRes.on('end', () => {
-            res.status(proxyRes.statusCode);
-            res.setHeader('Content-Type', 'application/json');
-            res.end(body);
-        });
-    });
-
-    proxyReq.on('error', (err) => {
-        res.status(502).json({
-            error: 'Unable to reach Persona API',
-            details: err.message
-        });
-    });
-
-    proxyReq.end();
-});
-
-// Outlier verification endpoint - PRODUCTION, real Persona API
-app.get('/outlier/verifications', async (req, res) => {
-    const id = req.query._id;
-    if (!id) {
+app.get('/internal/worker/verifications', async (req, res) => {
+    const userId = req.query._id;
+    if (!userId) {
         return res.status(400).json({ error: 'Missing _id parameter' });
     }
 
-    const options = {
-        hostname: 'api.withpersona.com',
-        path: '/api/v1/inquiries/' + id,
-        method: 'GET',
-        headers: {
-            'Authorization': 'Bearer ' + PERSONA_API_KEY,
-            'Persona-Version': '2023-01-01'
+    try {
+        const { data: verifications, error } = await supabase
+            .from('verifications')
+            .select('*')
+            .eq('user_id', userId)
+            .order('created_at', { ascending: false });
+
+        if (error) {
+            console.error('Supabase query error:', error);
+            return res.status(500).json({ error: 'Database query failed' });
         }
-    };
 
-    const proxyReq = https.request(options, (proxyRes) => {
-        let body = '';
-        proxyRes.on('data', (chunk) => body += chunk);
-        proxyRes.on('end', () => {
-            if (proxyRes.statusCode !== 200) {
-                return res.status(proxyRes.statusCode).json({
-                    error: 'Persona API error',
-                    details: body
-                });
-            }
+        if (verifications && verifications.length > 0) {
+            const userVerifications = verifications.map(v => ({
+                _id: v.user_id,
+                createdAt: v.created_at,
+                status: 'inquiry.' + v.status.toLowerCase(),
+                templateId: v.template_id,
+                inquiryId: v.inquiry_id,
+                internalFlags: [],
+                statusUpdatedAt: v.updated_at,
+                personaAccountId: v.persona_account_id
+            }));
 
-            try {
-                const parsed = JSON.parse(body);
-                const inquiry = parsed.data;
-                
-                // Transform to Outlier format - but keep real data
-                res.json({
-                    userVerifications: [{
-                        _id: id,
-                        createdAt: inquiry.attributes['created-at'],
-                        status: 'inquiry.' + (inquiry.attributes.status || 'unknown').toLowerCase(),
-                        verificationStatus: inquiry.attributes['verification-status'] || null,
-                        templateId: inquiry.relationships?.['inquiry-template']?.data?.id || null,
-                        inquiryId: inquiry.id,
-                        internalFlags: [],
-                        statusUpdatedAt: inquiry.attributes['updated-at'],
-                        personaAccountId: inquiry.relationships?.account?.data?.id || null
-                    }]
-                });
-            } catch (e) {
-                console.error('Error parsing Persona response:', e);
-                res.status(502).json({
-                    error: 'Invalid response from Persona'
-                });
-            }
-        });
-    });
+            return res.json({ userVerifications });
+        }
 
-    proxyReq.on('error', (err) => {
+        res.json({ userVerifications: [] });
+
+    } catch (err) {
+        console.error('Worker verifications error:', err); 
         res.status(502).json({
-            error: 'Unable to reach Persona API',
-            details: err.message
+            error: 'Unable to fetch verifications'
         });
-    });
-
-    proxyReq.end();
+    }
 });
 
 app.get('/health', (req, res) => {
     res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-app.get('/redirect', (req, res) => {
-    res.send(`<!DOCTYPE html>
-<html>
-<head><title>Verification Complete</title></head>
-<body style="font-family:Arial;text-align:center;padding-top:50px;">
-  <h2>Verification Complete</h2>
-  <p>You can close this window.</p>
-  <script>
-    if(window.parent) {
-      window.parent.postMessage({
-        type: "PERSONA_VERIFICATION_COMPLETE",
-        status: "approved"
-      }, "*");
+app.post('/api/start-verification', async (req, res) => {
+    const { referenceId, userId } = req.body;
+
+    if (!referenceId || !userId) {
+        return res.status(400).json({ error: 'referenceId and userId are required' });
     }
-  </script>
-</body>
-</html>`);
+
+    logUsage({ endpoint: '/api/start-verification', referenceId, userId });
+
+    try {
+        const payload = {
+            data: {
+                attributes: {
+                    "template-id": TEMPLATE_ID,
+                    "reference-id": referenceId,
+                    "redirect-uri": "https://scaramouch1.onrender.com/redirect"
+                }
+            }
+        };
+
+        const data = JSON.stringify(payload);
+
+        const options = {
+            hostname: 'api.withpersona.com',
+            path: '/api/v1/inquiries',
+            method: 'POST',
+            headers: {
+                'Authorization': 'Bearer ' + PERSONA_API_KEY,
+                'Content-Type': 'application/json',
+                'Content-Length': Buffer.byteLength(data),
+                'Persona-Version': '2023-01-01'
+            }
+        };
+
+        const proxyReq = https.request(options, (proxyRes) => {
+            let body = '';
+            proxyRes.on('data', (chunk) => body += chunk);
+            proxyRes.on('end', async () => {
+                if (proxyRes.statusCode !== 200 && proxyRes.statusCode !== 201) {
+                    console.error('Persona error:', body);
+                    return res.status(proxyRes.statusCode).json({
+                        error: 'Persona API error',
+                        details: JSON.parse(body)
+                    });
+                }
+
+                try {
+                    const parsed = JSON.parse(body);
+                    const flowUrl = parsed.meta?.['one-time-link'];
+                    const inquiryId = parsed.data?.id;
+                    
+                    if (!flowUrl || !inquiryId) {
+                        return res.status(500).json({
+                            error: 'Missing flow URL or inquiry ID from Persona'
+                        });
+                    }
+
+                    const { error: insertError } = await supabase
+                        .from('verifications')
+                        .insert({
+                            inquiry_id: inquiryId,
+                            reference_id: referenceId,
+                            user_id: userId,
+                            template_id: TEMPLATE_ID,
+                            status: 'created',
+                            created_at: new Date().toISOString(),
+                            updated_at: new Date().toISOString()
+                        });
+
+                    if (insertError) {
+                        console.error('Supabase insert error:', insertError);
+                    }
+
+                    res.json({
+                        success: true,
+                        userId: userId,
+                        flowUrl: flowUrl,
+                        referenceId: referenceId
+                    });
+                } catch (e) {
+                    console.error('Failed to parse Persona response:', e);
+                    res.status(502).json({
+                        error: 'Invalid response from Persona'
+                    });
+                }
+            });
+        });
+
+        proxyReq.on('error', (err) => {
+            console.error('Proxy error:', err);
+            res.status(502).json({
+                error: 'Unable to reach Persona API',
+                details: err.message
+            });
+        });
+
+        proxyReq.write(data);
+        proxyReq.end();
+
+    } catch (err) {
+        console.error('Error starting verification:', err);
+        res.status(500).json({
+            error: 'Failed to start verification',
+            details: err.message
+        });
+    }
+});
+
+app.post('/api/webhook', async (req, res) => {
+    const rawBody = req.rawBody;
+    
+    if (!verifyWebhookSignature(req, rawBody)) {
+        console.error('Invalid webhook signature');
+        return res.status(401).json({ error: 'Invalid signature' });
+    }
+
+    const body = req.body;
+    logUsage({ endpoint: '/api/webhook', eventType: body.type });
+
+    const inquiryId = body.data?.id;
+    const status = body.data?.attributes?.status;
+    const referenceId = body.data?.attributes?.['reference-id'];
+    const verificationStatus = body.data?.attributes?.['verification-status'];
+    const accountId = body.data?.relationships?.account?.data?.id;
+
+    if (!inquiryId) {
+        return res.status(400).json({ error: 'Missing inquiry ID' });
+    }
+
+    try {
+        console.log(`Verification ${status} for inquiry ${inquiryId}, reference: ${referenceId}`);
+
+        const { data: existingVerification } = await supabase
+            .from('verifications')
+            .select('user_id')
+            .eq('inquiry_id', inquiryId)
+            .single();
+
+        const { error: upsertError } = await supabase
+            .from('verifications')
+            .upsert({
+                inquiry_id: inquiryId,
+                reference_id: referenceId,
+                user_id: existingVerification?.user_id,
+                status: status,
+                verification_status: verificationStatus,
+                persona_account_id: accountId,
+                webhook_data: body,
+                updated_at: new Date().toISOString()
+            }, {
+                onConflict: 'inquiry_id'
+            });
+
+        if (upsertError) {
+            console.error('Supabase upsert error:', upsertError);
+        }
+
+        res.json({
+            success: true,
+            message: 'Webhook received'
+        });
+
+    } catch (err) {
+        console.error('Webhook processing error:', err);
+        res.status(500).json({
+            error: 'Webhook processing failed'
+        });
+    }
+});
+
+app.get('/api/verification-status', async (req, res) => {
+    const userId = req.query._id;
+
+    if (!userId) {
+        return res.status(400).json({ error: '_id parameter is required' });
+    }
+
+    try {
+        const { data: verifications, error } = await supabase
+            .from('verifications')
+            .select('*')
+            .eq('user_id', userId)
+            .order('created_at', { ascending: false })
+            .limit(1);
+
+        if (error) {
+            console.error('Supabase query error:', error);
+            return res.status(500).json({ error: 'Database query failed' });
+        }
+
+        if (verifications && verifications.length > 0) {
+            const verification = verifications[0];
+            
+            if (verification.status !== 'created') {
+                return res.json({
+                    _id: verification.user_id,
+                    referenceId: verification.reference_id,
+                    status: verification.status,
+                    verificationStatus: verification.verification_status,
+                    completedAt: verification.updated_at,
+                    verified: verification.status === 'approved' || verification.status === 'completed'
+                });
+            }
+
+            const options = {
+                hostname: 'api.withpersona.com',
+                path: '/api/v1/inquiries/' + verification.inquiry_id,
+                method: 'GET',
+                headers: {
+                    'Authorization': 'Bearer ' + PERSONA_API_KEY,
+                    'Persona-Version': '2023-01-01'
+                }
+            };
+
+            const response = await new Promise((resolve, reject) => {
+                const req = https.request(options, (res) => {
+                    let body = '';
+                    res.on('data', (chunk) => body += chunk);
+                    res.on('end', () => resolve({ statusCode: res.statusCode, body }));
+                    res.on('error', reject);
+                });
+                req.on('error', reject);
+                req.end();
+            });
+
+            if (response.statusCode !== 200) {
+                return res.status(response.statusCode).json({
+                    error: 'Persona API error',
+                    details: response.body
+                });
+            }
+
+            const parsed = JSON.parse(response.body);
+            const inquiry = parsed.data;
+            const status = inquiry.attributes?.status || 'unknown';
+            const inquiryVerificationStatus = inquiry.attributes?.['verification-status'] || null;
+
+            const { error: updateError } = await supabase
+                .from('verifications')
+                .update({
+                    status: status,
+                    verification_status: inquiryVerificationStatus,
+                    updated_at: new Date().toISOString()
+                })
+                .eq('id', verification.id);
+
+            if (updateError) {
+                console.error('Supabase update error:', updateError);
+            }
+
+            return res.json({
+                _id: verification.user_id,
+                referenceId: verification.reference_id,
+                status: status,
+                verificationStatus: inquiryVerificationStatus,
+                verified: status === 'approved' || status === 'completed' || inquiryVerificationStatus === 'verified'
+            });
+        }
+
+        return res.status(404).json({ error: 'No verification found' });
+
+    } catch (err) {
+        console.error('Error checking status:', err);
+        res.status(500).json({
+            error: 'Failed to check verification status'
+        });
+    }
 });
 
 app.get('/logs', (req, res) => {
@@ -264,5 +404,7 @@ app.get('/logs', (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-    console.log(`Proxy running on port ${PORT}`);
+    console.log(`Server running on port ${PORT}`);
+    console.log(`Template ID: ${TEMPLATE_ID}`);
+    console.log(`Webhook URL: https://scaramouch1.onrender.com/api/webhook`);
 });
