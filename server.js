@@ -532,6 +532,13 @@ app.post('/api/extension', extensionAuthMiddleware, async (req, res) => {
         return res.status(result.httpStatus).json(result.body);
     }
 
+    if (action === 'get_persona_config') {
+    return res.json({
+        templateId: TEMPLATE_ID,
+        environmentId: process.env.PERSONA_ENVIRONMENT_ID
+    });
+}
+
     return res.status(400).json({ error: `Unknown action: ${action}` });
 });
 
