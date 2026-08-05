@@ -132,30 +132,36 @@ app.get('/internal/worker/verifications', async (req, res) => {
     }
 });
 
-app.get('/health', (req, res) => {
-    res.json({ status: 'ok', timestamp: new Date().toISOString() });
+app.get('/health', (req, res) => 
+
+    { res.json({ status: 'ok', timestamp: new Date().toISOString() }); 
+
 });
 
 app.post('/api/start-verification', async (req, res) => {
     const { referenceId, userId } = req.body;
 
     if (!referenceId || !userId) {
-        return res.status(400).json({ error: 'referenceId and userId are required' });
+        return res.status(400).json({
+            error: 'referenceId and userId are required'
+        });
     }
 
-    logUsage({ endpoint: '/api/start-verification', referenceId, userId });
+    logUsage({
+        endpoint: '/api/start-verification',
+        referenceId,
+        userId
+    });
 
     try {
         const payload = {
-        data: {
-        attributes: {
-            "inquiry-template-id": TEMPLATE_ID,
-            "reference-id": referenceId,
-            "redirect-uri": "https://scaramouch1.onrender.com/redirect"
-        }
-         
-    }
-       
+            data: {
+                attributes: {
+                    "inquiry-template-id": TEMPLATE_ID,
+                    "reference-id": referenceId,
+                    "redirect-uri": "https://scaramouch1.onrender.com/redirect"
+                }
+            }
         };
 
         const data = JSON.stringify(payload);
@@ -168,16 +174,25 @@ app.post('/api/start-verification', async (req, res) => {
                 'Authorization': 'Bearer ' + PERSONA_API_KEY,
                 'Content-Type': 'application/json',
                 'Content-Length': Buffer.byteLength(data),
-                'Persona-Version': '2023-01-01'
+                'Persona-Version': '2025-12-08'
             }
         };
 
         const proxyReq = https.request(options, (proxyRes) => {
             let body = '';
-            proxyRes.on('data', (chunk) => body += chunk);
+
+            proxyRes.on('data', (chunk) => {
+                body += chunk;
+            });
+
             proxyRes.on('end', async () => {
+
+                console.log("Persona status:", proxyRes.statusCode);
+                console.log("Persona response:", body);
+
                 if (proxyRes.statusCode !== 200 && proxyRes.statusCode !== 201) {
                     console.error('Persona error:', body);
+
                     return res.status(proxyRes.statusCode).json({
                         error: 'Persona API error',
                         details: JSON.parse(body)
@@ -186,14 +201,40 @@ app.post('/api/start-verification', async (req, res) => {
 
                 try {
                     const parsed = JSON.parse(body);
-                    const flowUrl = parsed.meta?.['one-time-link'];
+
                     const inquiryId = parsed.data?.id;
-                    
-                    if (!flowUrl || !inquiryId) {
+
+                    const flowUrl =
+                        parsed.meta?.['one-time-link'] ||
+                        parsed.meta?.['one_time_link'] ||
+                        parsed.meta?.['session-url'] ||
+                        parsed.meta?.['session_url'];
+
+
+                    if (!inquiryId) {
+                        console.error(
+                            "Missing inquiry ID from Persona response:",
+                            parsed
+                        );
+
                         return res.status(500).json({
-                            error: 'Missing flow URL or inquiry ID from Persona'
+                            error: 'Missing inquiry ID from Persona'
                         });
                     }
+
+
+                    if (!flowUrl) {
+                        console.error(
+                            "Missing flow URL from Persona response:",
+                            parsed
+                        );
+
+                        return res.status(500).json({
+                            error: 'Missing flow URL from Persona',
+                            inquiryId: inquiryId
+                        });
+                    }
+
 
                     const { error: insertError } = await supabase
                         .from('verifications')
@@ -207,38 +248,64 @@ app.post('/api/start-verification', async (req, res) => {
                             updated_at: new Date().toISOString()
                         });
 
+
                     if (insertError) {
-                        console.error('Supabase insert error:', insertError);
+                        console.error(
+                            'Supabase insert error:',
+                            insertError
+                        );
                     }
 
-                    res.json({
+
+                    return res.json({
                         success: true,
                         userId: userId,
+                        inquiryId: inquiryId,
                         flowUrl: flowUrl,
                         referenceId: referenceId
                     });
+
+
                 } catch (e) {
-                    console.error('Failed to parse Persona response:', e);
-                    res.status(502).json({
+
+                    console.error(
+                        'Failed to parse Persona response:',
+                        e
+                    );
+
+                    return res.status(502).json({
                         error: 'Invalid response from Persona'
                     });
                 }
             });
         });
 
+
         proxyReq.on('error', (err) => {
-            console.error('Proxy error:', err);
+
+            console.error(
+                'Proxy error:',
+                err
+            );
+
             res.status(502).json({
-                error: 'Unable to reach Persona API',
+                error: 'Unable to reach Persona',
                 details: err.message
             });
         });
 
+
         proxyReq.write(data);
         proxyReq.end();
 
+
     } catch (err) {
-        console.error('Error starting verification:', err);
+
+        console.error(
+            'Error starting verification:',
+            err
+        );
+
         res.status(500).json({
             error: 'Failed to start verification',
             details: err.message
