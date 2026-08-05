@@ -137,9 +137,6 @@ function verifyWebhookSignature(req, rawBody) {
     }
 }
 
-// ---------------------------------------------------------------------
-// Shared helpers for fetching live status from Persona and syncing to DB
-// ---------------------------------------------------------------------
 
 function isTerminalPersonaStatus(status) {
     if (!status) return false;
@@ -169,9 +166,6 @@ function fetchInquiryFromPersona(inquiryId) {
     });
 }
 
-// Pulls the latest status for a verification row directly from Persona
-// and writes it back to Supabase. Returns the updated row (merged with
-// what was passed in), or null if the Persona call failed.
 async function refreshVerificationFromPersona(verification) {
     if (!verification || !verification.inquiry_id) return null;
 
@@ -224,15 +218,9 @@ async function refreshVerificationFromPersona(verification) {
     };
 }
 
-// ---------------------------------------------------------------------
-// Simple in-memory rate limiter (no extra dependency required)
-// Limits by client IP AND by userId, since either could be abused.
-// ---------------------------------------------------------------------
 
 function createRateLimiter({ windowMs, max }) {
-    const hits = new Map(); // key -> [timestamps]
-
-    // periodic cleanup so the map doesn't grow forever
+    const hits = new Map(); 
     setInterval(() => {
         const now = Date.now();
         for (const [key, timestamps] of hits.entries()) {
@@ -260,8 +248,6 @@ function createRateLimiter({ windowMs, max }) {
     };
 }
 
-// 5 verification starts per IP per 10 minutes, 3 per userId per 10 minutes.
-// Tune these numbers to your actual traffic/abuse profile.
 const checkIpRateLimit = createRateLimiter({ windowMs: 10 * 60 * 1000, max: 5 });
 const checkUserRateLimit = createRateLimiter({ windowMs: 10 * 60 * 1000, max: 3 });
 
@@ -290,23 +276,9 @@ function startVerificationRateLimiter(req, res, next) {
     next();
 }
 
-// ---------------------------------------------------------------------
-// Extension session store (in-memory)
-//
-// IMPORTANT CAVEAT: chrome.runtime.id is NOT a secret - it's visible in
-// the Chrome Web Store listing and in the extension's own source. This
-// session layer confirms "a client claiming to be extension X asked for
-// a token" and lets us rate-limit/revoke access - it does NOT
-// cryptographically prove the request truly came from your extension.
-// A determined attacker could extract your extension ID and request
-// their own tokens. This is a reasonable deterrent against casual abuse,
-// not a substitute for a real secret if you need stronger guarantees.
-// ---------------------------------------------------------------------
 
-const SESSION_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
-const sessions = new Map(); // token -> { extensionId, expiresAt }
-
-// periodic cleanup of expired sessions
+const SESSION_TTL_MS = 24 * 60 * 60 * 1000; 
+const sessions = new Map(); 
 setInterval(() => {
     const now = Date.now();
     for (const [token, session] of sessions.entries()) {
@@ -316,7 +288,6 @@ setInterval(() => {
     }
 }, 60 * 60 * 1000).unref();
 
-// Chrome extension IDs are exactly 32 lowercase letters a-p.
 function isValidExtensionId(id) {
     return typeof id === 'string' && /^[a-p]{32}$/.test(id);
 }
@@ -367,10 +338,6 @@ function extensionAuthMiddleware(req, res, next) {
     next();
 }
 
-// ---------------------------------------------------------------------
-// Shared verification logic, reused by both the direct HTTP routes and
-// the /api/extension dispatcher so there's a single source of truth.
-// ---------------------------------------------------------------------
 
 async function startVerificationForUser({ referenceId, userId, redirectUri }) {
     if (!referenceId || !userId || !redirectUri) {
@@ -467,7 +434,7 @@ async function getVerificationStatusForUser(userId) {
         if (verifications && verifications.length > 0) {
             const verification = verifications[0];
 
-            if (verification.status !== 'created') {
+            if (isTerminalPersonaStatus(verification.status)) {
                 return {
                     httpStatus: 200,
                     body: {
@@ -510,9 +477,6 @@ async function getVerificationStatusForUser(userId) {
     }
 }
 
-// ---------------------------------------------------------------------
-// Routes
-// ---------------------------------------------------------------------
 
 app.post('/auth/session', (req, res) => {
     const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket.remoteAddress || 'unknown';
@@ -614,9 +578,6 @@ app.get('/internal/persona/most-recent-inquiry', async (req, res) => {
         }
 
 
-        // Self-heal: if we don't yet have a terminal status cached,
-        // check Persona live before responding so this endpoint never
-        // gets permanently stuck on a stale "created" status.
         if (!isTerminalPersonaStatus(inquiry.status)) {
             const refreshed = await refreshVerificationFromPersona(inquiry);
             if (refreshed) {
@@ -708,7 +669,6 @@ app.get('/internal/worker/verifications', async (req, res) => {
 
         if (verifications && verifications.length > 0) {
 
-            // Self-heal: refresh from Persona live if not yet terminal.
             if (!isTerminalPersonaStatus(verifications[0].status)) {
                 const refreshed = await refreshVerificationFromPersona(verifications[0]);
                 if (refreshed) {
@@ -835,8 +795,6 @@ app.post('/api/webhook', async (req, res) => {
     });
 
 
-    // Persona wraps the actual inquiry inside an Event envelope:
-    // { data: { type: 'event', id: 'evt_...', attributes: { name, payload: { data: <inquiry> } } } }
     const inquiryPayload = body.data?.attributes?.payload?.data;
 
     const inquiryId = inquiryPayload?.id;
@@ -879,7 +837,7 @@ app.post('/api/webhook', async (req, res) => {
             await supabase
             .from('verifications')
             .select(
-                'user_id, reference_id, persona_account_id'
+                'user_id, reference_id, persona_account_id, status, verification_status'
             )
             .eq(
                 'inquiry_id',
@@ -888,6 +846,17 @@ app.post('/api/webhook', async (req, res) => {
             .maybeSingle();
 
 
+        const existingStatus = existingVerification?.status;
+        const incomingIsStale =
+            existingStatus &&
+            isTerminalPersonaStatus(existingStatus) &&
+            !isTerminalPersonaStatus(status);
+
+        if (incomingIsStale) {
+            console.log(
+                `Ignoring stale webhook status "${status}" for ${inquiryId} - already terminal at "${existingStatus}"`
+            );
+        }
 
         const updateData = {
 
@@ -900,10 +869,13 @@ app.post('/api/webhook', async (req, res) => {
             user_id:
                 existingVerification?.user_id || null,
 
-            status: status,
+            status:
+                incomingIsStale ? existingStatus : status,
 
             verification_status:
-                verificationStatus || null,
+                incomingIsStale
+                    ? (existingVerification?.verification_status ?? null)
+                    : (verificationStatus || null),
 
             persona_account_id:
                 accountId || existingVerification?.persona_account_id || null,
