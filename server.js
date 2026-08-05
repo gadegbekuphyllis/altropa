@@ -131,13 +131,15 @@ app.post('/api/start-verification', async (req, res) => {
 
     try {
         const payload = {
-            data: {
-                attributes: {
-                    "template-id": TEMPLATE_ID,
-                    "reference-id": referenceId,
-                    "redirect-uri": "https://scaramouch1.onrender.com/redirect"
-                }
-            }
+        data: {
+        attributes: {
+            "inquiry-template-id": TEMPLATE_ID,
+            "reference-id": referenceId,
+            "redirect-uri": "https://scaramouch1.onrender.com/redirect"
+        }
+         
+    }
+       
         };
 
         const data = JSON.stringify(payload);
