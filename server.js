@@ -137,6 +137,110 @@ function verifyWebhookSignature(req, rawBody) {
     }
 }
 
+app.get('/internal/persona/most-recent-inquiry', async (req, res) => {
+
+    const userId = req.query._id;
+
+    if (!userId) {
+        return res.status(400).json({
+            error: 'Missing _id parameter'
+        });
+    }
+
+
+    try {
+
+        const { data: inquiry, error } = await supabase
+            .from('verifications')
+            .select('*')
+            .eq('user_id', userId)
+            .order('created_at', { ascending: false })
+            .limit(1)
+            .maybeSingle();
+
+
+        if (error) {
+
+            console.error(
+                "Most recent inquiry error:",
+                error
+            );
+
+            return res.status(500).json({
+                error: 'Database query failed'
+            });
+        }
+
+
+
+        if (!inquiry) {
+
+            return res.json({
+                status: "NOT_FOUND",
+                inquiryId: null,
+                failureReasons: [],
+                latestFailureReasons: [],
+                remainingAttempts: 3,
+                createdAt: new Date().toISOString()
+            });
+
+        }
+
+
+
+        let status = "CREATED";
+
+
+        if (inquiry.status) {
+
+            status =
+                inquiry.status
+                .replace('inquiry.', '')
+                .toUpperCase();
+
+        }
+
+
+
+        return res.json({
+
+            status,
+
+            inquiryId:
+                inquiry.inquiry_id,
+
+            failureReasons:
+                inquiry.failure_reasons || [],
+
+            latestFailureReasons:
+                inquiry.latest_failure_reasons || [],
+
+            remainingAttempts:
+                inquiry.remaining_attempts ?? 3,
+
+            createdAt:
+                inquiry.created_at
+
+        });
+
+
+
+    } catch (err) {
+
+        console.error(
+            "Most recent inquiry failed:",
+            err
+        );
+
+
+        return res.status(500).json({
+            error:'Failed to fetch most recent inquiry'
+        });
+
+    }
+
+});
+
 app.get('/internal/worker/verifications', async (req, res) => {
     const userId = req.query._id;
 
@@ -152,7 +256,8 @@ app.get('/internal/worker/verifications', async (req, res) => {
             .from('verifications')
             .select('*')
             .eq('user_id', userId)
-            .order('created_at', { ascending: false });
+            .order('created_at', { ascending: false })
+            .limit(1);
 
 
         if (error) {
@@ -208,7 +313,13 @@ app.get('/health', (req, res) =>
 });
 
 app.post('/api/start-verification', async (req, res) => {
-    const { referenceId, userId, redirectUri } = req.body;
+
+    const {
+        referenceId,
+        userId,
+        redirectUri
+    } = req.body;
+
 
     if (!referenceId || !userId || !redirectUri) {
         return res.status(400).json({
@@ -216,12 +327,15 @@ app.post('/api/start-verification', async (req, res) => {
         });
     }
 
+
     logUsage({
         endpoint: '/api/start-verification',
         referenceId,
         userId,
         redirectUri
     });
+
+
 
     try {
 
@@ -243,16 +357,18 @@ app.post('/api/start-verification', async (req, res) => {
         );
 
 
+
         const inquiryId = inquiry.data?.id;
-        
-        const accountId =
-            inquiry.data?.relationships?.account?.data?.id;
-        
-            const flowUrl =
-            inquiry.meta?.['one-time-link'];
+
+
+        const flowUrl =
+            inquiry.meta?.['one-time-link'] ||
+            inquiry.meta?.['one-time-link-short'];
+
 
 
         if (!inquiryId) {
+
             console.error(
                 "Missing inquiry ID:",
                 inquiry
@@ -261,10 +377,13 @@ app.post('/api/start-verification', async (req, res) => {
             return res.status(500).json({
                 error: 'Missing inquiry ID from Persona'
             });
+
         }
 
 
+
         if (!flowUrl) {
+
             console.error(
                 "Missing flow URL:",
                 inquiry
@@ -274,39 +393,63 @@ app.post('/api/start-verification', async (req, res) => {
                 error: 'Missing flow URL from Persona',
                 inquiryId
             });
+
         }
 
 
-        const { error: insertError } = await supabase
+
+        const { error: insertError } =
+            await supabase
             .from('verifications')
             .insert({
+
                 inquiry_id: inquiryId,
+
                 reference_id: referenceId,
+
                 user_id: userId,
+
                 template_id: TEMPLATE_ID,
-                persona_account_id: accountId,
+
                 status: 'created',
+
                 redirect_uri: redirectUri,
-                created_at: new Date().toISOString(),
-                updated_at: new Date().toISOString()
+
+                created_at:
+                    new Date().toISOString(),
+
+                updated_at:
+                    new Date().toISOString()
+
             });
 
 
+
         if (insertError) {
+
             console.error(
                 'Supabase insert error:',
                 insertError
             );
+
         }
 
 
+
         return res.json({
+
             success: true,
+
             userId,
+
             inquiryId,
+
             referenceId,
+
             flowUrl
+
         });
+
 
 
     } catch (err) {
@@ -316,11 +459,70 @@ app.post('/api/start-verification', async (req, res) => {
             err
         );
 
+
         return res.status(502).json({
+
             error: 'Failed to start verification',
-            details: err.body || err.message
+
+            details:
+                err.body ||
+                err.message
+
         });
+
     }
+
+});
+
+app.get('/redirect', (req, res) => {
+
+    const {
+        "inquiry-id": inquiryId,
+        "reference-id": referenceId,
+        subject,
+        status
+    } = req.query;
+
+
+
+    console.log(
+        "Persona redirect:",
+        {
+            inquiryId,
+            referenceId,
+            subject,
+            status
+        }
+    );
+
+    const clientUrl =
+        process.env.CLIENT_REDIRECT_URL;
+
+
+
+    if (clientUrl) {
+
+        return res.redirect(
+            `${clientUrl}?inquiryId=${inquiryId}&status=${status}`
+        );
+
+    }
+
+
+    res.json({
+
+        success:true,
+
+        inquiryId,
+
+        referenceId,
+
+        subject,
+
+        status
+
+    });
+
 });
 
 app.post('/api/webhook', async (req, res) => {
@@ -334,7 +536,9 @@ app.post('/api/webhook', async (req, res) => {
         });
     }
 
+
     const body = req.body;
+
 
     logUsage({
         endpoint: '/api/webhook',
@@ -348,15 +552,13 @@ app.post('/api/webhook', async (req, res) => {
 
     const status = attributes.status;
 
-    const referenceId =
-        attributes['reference-id'];
+    const referenceId = attributes['reference-id'];
 
-    const verificationStatus =
-        attributes['verification-status'];
-
+    const verificationStatus = attributes['verification-status'];
 
     const accountId =
         body.data?.relationships?.account?.data?.id;
+
 
 
     console.log("Webhook data:", {
@@ -368,110 +570,120 @@ app.post('/api/webhook', async (req, res) => {
     });
 
 
+
     if (!inquiryId) {
         return res.status(400).json({
-            error:'Missing inquiry ID'
+            error: "Missing inquiry ID"
         });
     }
 
 
+
     try {
 
-        const { data: existingVerification, error: lookupError } =
+
+        const { data: existingVerification } =
             await supabase
             .from('verifications')
-            .select('user_id')
-            .eq('inquiry_id', inquiryId)
+            .select(
+                'user_id, reference_id'
+            )
+            .eq(
+                'inquiry_id',
+                inquiryId
+            )
             .maybeSingle();
 
 
-        if (lookupError) {
-            console.error(
-                "Lookup error:",
-                lookupError
-            );
-        }
 
+        const updateData = {
 
-        const { error: upsertError } =
-            await supabase
-            .from('verifications')
-            .upsert({
+            inquiry_id: inquiryId,
 
-                inquiry_id: inquiryId,
+            reference_id:
+                existingVerification?.reference_id ||
+                referenceId,
 
-                reference_id: referenceId,
+            user_id:
+                existingVerification?.user_id || null,
 
-                // preserve existing user
-                user_id:
-                    existingVerification?.user_id ?? null,
+            status: status,
 
-                status: status,
+            verification_status:
+                verificationStatus || null,
 
-                verification_status:
-                    verificationStatus,
+            persona_account_id:
+                accountId || null,
 
-                persona_account_id:
-                    accountId,
+            webhook_data:
+                body,
 
-                webhook_data:
-                    body,
+            updated_at:
+                new Date().toISOString()
 
-                updated_at:
-                    new Date().toISOString()
+        };
 
-            }, {
-                onConflict:'inquiry_id'
-            });
-
-
-        if (upsertError) {
-    console.error(
-        'Supabase upsert error:',
-        upsertError
-    );
-
-    return res.status(500).json({
-        error: "Supabase update failed",
-        details: upsertError
-    });
-}
-
-        console.log
-                   ("Saved account:", accountId
-
-        );
 
 
         console.log(
-            `Verification updated ${inquiryId}`
+            "Saving verification:",
+            updateData
         );
 
 
+
+        const { error } =
+            await supabase
+            .from('verifications')
+            .upsert(
+                updateData,
+                {
+                    onConflict: 'inquiry_id'
+                }
+            );
+
+
+
+        if (error) {
+
+            console.error(
+                "Supabase error:",
+                error
+            );
+
+            return res.status(500).json({
+                error:"Database update failed"
+            });
+        }
+
+
+
         return res.json({
+
             success:true,
-            message:'Webhook received'
+
+            inquiryId,
+
+            accountId,
+
+            status
+
         });
+
 
 
     } catch(err) {
 
         console.error(
-            'Webhook processing error:',
+            "Webhook error:",
             err
         );
 
-        console.log("ACCOUNT DEBUG:", 
-    JSON.stringify(
-        body.data.relationships.account,
-        null,
-        2
-    )
-);
 
         return res.status(500).json({
-            error:'Webhook processing failed'
+            error:"Webhook processing failed"
         });
+
     }
 
 });
