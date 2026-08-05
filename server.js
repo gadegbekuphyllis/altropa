@@ -137,6 +137,9 @@ function verifyWebhookSignature(req, rawBody) {
     }
 }
 
+// ---------------------------------------------------------------------
+// Shared helpers for fetching live status from Persona and syncing to DB
+// ---------------------------------------------------------------------
 
 function isTerminalPersonaStatus(status) {
     if (!status) return false;
@@ -166,7 +169,9 @@ function fetchInquiryFromPersona(inquiryId) {
     });
 }
 
-
+// Pulls the latest status for a verification row directly from Persona
+// and writes it back to Supabase. Returns the updated row (merged with
+// what was passed in), or null if the Persona call failed.
 async function refreshVerificationFromPersona(verification) {
     if (!verification || !verification.inquiry_id) return null;
 
@@ -219,9 +224,15 @@ async function refreshVerificationFromPersona(verification) {
     };
 }
 
+// ---------------------------------------------------------------------
+// Simple in-memory rate limiter (no extra dependency required)
+// Limits by client IP AND by userId, since either could be abused.
+// ---------------------------------------------------------------------
 
 function createRateLimiter({ windowMs, max }) {
-    const hits = new Map(); 
+    const hits = new Map(); // key -> [timestamps]
+
+    // periodic cleanup so the map doesn't grow forever
     setInterval(() => {
         const now = Date.now();
         for (const [key, timestamps] of hits.entries()) {
@@ -249,6 +260,8 @@ function createRateLimiter({ windowMs, max }) {
     };
 }
 
+// 5 verification starts per IP per 10 minutes, 3 per userId per 10 minutes.
+// Tune these numbers to your actual traffic/abuse profile.
 const checkIpRateLimit = createRateLimiter({ windowMs: 10 * 60 * 1000, max: 5 });
 const checkUserRateLimit = createRateLimiter({ windowMs: 10 * 60 * 1000, max: 3 });
 
@@ -277,6 +290,279 @@ function startVerificationRateLimiter(req, res, next) {
     next();
 }
 
+// ---------------------------------------------------------------------
+// Extension session store (in-memory)
+//
+// IMPORTANT CAVEAT: chrome.runtime.id is NOT a secret - it's visible in
+// the Chrome Web Store listing and in the extension's own source. This
+// session layer confirms "a client claiming to be extension X asked for
+// a token" and lets us rate-limit/revoke access - it does NOT
+// cryptographically prove the request truly came from your extension.
+// A determined attacker could extract your extension ID and request
+// their own tokens. This is a reasonable deterrent against casual abuse,
+// not a substitute for a real secret if you need stronger guarantees.
+// ---------------------------------------------------------------------
+
+const SESSION_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+const sessions = new Map(); // token -> { extensionId, expiresAt }
+
+// periodic cleanup of expired sessions
+setInterval(() => {
+    const now = Date.now();
+    for (const [token, session] of sessions.entries()) {
+        if (session.expiresAt < now) {
+            sessions.delete(token);
+        }
+    }
+}, 60 * 60 * 1000).unref();
+
+// Chrome extension IDs are exactly 32 lowercase letters a-p.
+function isValidExtensionId(id) {
+    return typeof id === 'string' && /^[a-p]{32}$/.test(id);
+}
+
+function issueSessionToken(extensionId) {
+    const token = crypto.randomBytes(32).toString('hex');
+    sessions.set(token, {
+        extensionId,
+        expiresAt: Date.now() + SESSION_TTL_MS
+    });
+    return token;
+}
+
+function validateSession(token, extensionId) {
+    if (!token || !extensionId) return false;
+    const session = sessions.get(token);
+    if (!session) return false;
+    if (session.expiresAt < Date.now()) {
+        sessions.delete(token);
+        return false;
+    }
+    return session.extensionId === extensionId;
+}
+
+const checkSessionIpRateLimit = createRateLimiter({ windowMs: 10 * 60 * 1000, max: 10 });
+const checkExtensionActionRateLimit = createRateLimiter({ windowMs: 10 * 60 * 1000, max: 10 });
+
+function extensionAuthMiddleware(req, res, next) {
+    const token = req.headers['x-session-token'];
+    const extensionId = req.headers['x-extension-id'];
+
+    if (!validateSession(token, extensionId)) {
+        return res.status(401).json({
+            error: 'Invalid or expired session. Please re-initialize and try again.'
+        });
+    }
+
+    const actionResult = checkExtensionActionRateLimit(`ext:${extensionId}`);
+    if (actionResult.limited) {
+        res.set('Retry-After', String(actionResult.retryAfterSeconds));
+        return res.status(429).json({
+            error: 'Too many requests from this extension. Please try again later.',
+            retryAfterSeconds: actionResult.retryAfterSeconds
+        });
+    }
+
+    req.extensionId = extensionId;
+    next();
+}
+
+// ---------------------------------------------------------------------
+// Shared verification logic, reused by both the direct HTTP routes and
+// the /api/extension dispatcher so there's a single source of truth.
+// ---------------------------------------------------------------------
+
+async function startVerificationForUser({ referenceId, userId, redirectUri }) {
+    if (!referenceId || !userId || !redirectUri) {
+        return { httpStatus: 400, body: { error: 'referenceId, userId and redirectUri are required' } };
+    }
+
+    logUsage({
+        endpoint: '/api/start-verification',
+        referenceId,
+        userId,
+        redirectUri
+    });
+
+    try {
+        const inquiry = await personaRequest(
+            '/api/v1/inquiries',
+            'POST',
+            {
+                data: {
+                    attributes: {
+                        "inquiry-template-id": TEMPLATE_ID,
+                        "reference-id": referenceId,
+                        "redirect-uri": redirectUri
+                    }
+                },
+                meta: {
+                    "auto-create-one-time-link": true
+                }
+            }
+        );
+
+        const inquiryId = inquiry.data?.id;
+        const flowUrl = inquiry.meta?.['one-time-link'] || inquiry.meta?.['one-time-link-short'];
+
+        if (!inquiryId) {
+            console.error("Missing inquiry ID:", inquiry);
+            return { httpStatus: 500, body: { error: 'Missing inquiry ID from Persona' } };
+        }
+
+        if (!flowUrl) {
+            console.error("Missing flow URL:", inquiry);
+            return { httpStatus: 500, body: { error: 'Missing flow URL from Persona', inquiryId } };
+        }
+
+        const { error: insertError } = await supabase
+            .from('verifications')
+            .insert({
+                inquiry_id: inquiryId,
+                reference_id: referenceId,
+                user_id: userId,
+                template_id: TEMPLATE_ID,
+                status: 'created',
+                redirect_uri: redirectUri,
+                created_at: new Date().toISOString(),
+                updated_at: new Date().toISOString()
+            });
+
+        if (insertError) {
+            console.error('Supabase insert error:', insertError);
+        }
+
+        return {
+            httpStatus: 200,
+            body: { success: true, userId, inquiryId, referenceId, flowUrl }
+        };
+
+    } catch (err) {
+        console.error('Error starting verification:', err);
+        return {
+            httpStatus: 502,
+            body: { error: 'Failed to start verification', details: err.body || err.message }
+        };
+    }
+}
+
+async function getVerificationStatusForUser(userId) {
+    if (!userId) {
+        return { httpStatus: 400, body: { error: '_id parameter is required' } };
+    }
+
+    try {
+        const { data: verifications, error } = await supabase
+            .from('verifications')
+            .select('*')
+            .eq('user_id', userId)
+            .order('created_at', { ascending: false })
+            .limit(1);
+
+        if (error) {
+            console.error('Supabase query error:', error);
+            return { httpStatus: 500, body: { error: 'Database query failed' } };
+        }
+
+        if (verifications && verifications.length > 0) {
+            const verification = verifications[0];
+
+            if (verification.status !== 'created') {
+                return {
+                    httpStatus: 200,
+                    body: {
+                        _id: verification.user_id,
+                        referenceId: verification.reference_id,
+                        status: verification.status,
+                        verificationStatus: verification.verification_status,
+                        completedAt: verification.updated_at,
+                        verified: verification.status === 'approved' || verification.status === 'completed'
+                    }
+                };
+            }
+
+            const refreshed = await refreshVerificationFromPersona(verification);
+
+            if (!refreshed) {
+                return { httpStatus: 502, body: { error: 'Persona API error' } };
+            }
+
+            const status = refreshed.status;
+            const inquiryVerificationStatus = refreshed.verification_status;
+
+            return {
+                httpStatus: 200,
+                body: {
+                    _id: verification.user_id,
+                    referenceId: verification.reference_id,
+                    status: status,
+                    verificationStatus: inquiryVerificationStatus,
+                    verified: status === 'approved' || status === 'completed' || inquiryVerificationStatus === 'verified'
+                }
+            };
+        }
+
+        return { httpStatus: 404, body: { error: 'No verification found' } };
+
+    } catch (err) {
+        console.error('Error checking status:', err);
+        return { httpStatus: 500, body: { error: 'Failed to check verification status' } };
+    }
+}
+
+// ---------------------------------------------------------------------
+// Routes
+// ---------------------------------------------------------------------
+
+app.post('/auth/session', (req, res) => {
+    const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket.remoteAddress || 'unknown';
+
+    const ipResult = checkSessionIpRateLimit(`ip:${ip}`);
+    if (ipResult.limited) {
+        res.set('Retry-After', String(ipResult.retryAfterSeconds));
+        return res.status(429).json({
+            error: 'Too many session requests from this address. Please try again later.',
+            retryAfterSeconds: ipResult.retryAfterSeconds
+        });
+    }
+
+    const { extensionId } = req.body;
+
+    if (!isValidExtensionId(extensionId)) {
+        return res.status(400).json({ error: 'Missing or invalid extensionId' });
+    }
+
+    const token = issueSessionToken(extensionId);
+
+    logUsage({ endpoint: '/auth/session', extensionId });
+
+    return res.json({
+        token,
+        expiresIn: SESSION_TTL_MS / 1000
+    });
+});
+
+app.post('/api/extension', extensionAuthMiddleware, async (req, res) => {
+    const { action, userId, referenceId, redirectUri } = req.body;
+
+    logUsage({ endpoint: '/api/extension', action, extensionId: req.extensionId, userId });
+
+    if (action === 'start_verification') {
+        const result = await startVerificationForUser({
+            referenceId: referenceId || userId,
+            userId,
+            redirectUri: redirectUri || `${req.protocol}://${req.get('host')}/redirect`
+        });
+        return res.status(result.httpStatus).json(result.body);
+    }
+
+    if (action === 'verification_status') {
+        const result = await getVerificationStatusForUser(userId);
+        return res.status(result.httpStatus).json(result.body);
+    }
+
+    return res.status(400).json({ error: `Unknown action: ${action}` });
+});
 
 app.get('/internal/persona/most-recent-inquiry', async (req, res) => {
 
@@ -327,6 +613,10 @@ app.get('/internal/persona/most-recent-inquiry', async (req, res) => {
 
         }
 
+
+        // Self-heal: if we don't yet have a terminal status cached,
+        // check Persona live before responding so this endpoint never
+        // gets permanently stuck on a stale "created" status.
         if (!isTerminalPersonaStatus(inquiry.status)) {
             const refreshed = await refreshVerificationFromPersona(inquiry);
             if (refreshed) {
@@ -417,6 +707,8 @@ app.get('/internal/worker/verifications', async (req, res) => {
 
 
         if (verifications && verifications.length > 0) {
+
+            // Self-heal: refresh from Persona live if not yet terminal.
             if (!isTerminalPersonaStatus(verifications[0].status)) {
                 const refreshed = await refreshVerificationFromPersona(verifications[0]);
                 if (refreshed) {
@@ -466,165 +758,9 @@ app.get('/health', (req, res) =>
 });
 
 app.post('/api/start-verification', startVerificationRateLimiter, async (req, res) => {
-
-    const {
-        referenceId,
-        userId,
-        redirectUri
-    } = req.body;
-
-
-    if (!referenceId || !userId || !redirectUri) {
-        return res.status(400).json({
-            error: 'referenceId, userId and redirectUri are required'
-        });
-    }
-
-
-    logUsage({
-        endpoint: '/api/start-verification',
-        referenceId,
-        userId,
-        redirectUri
-    });
-
-
-
-    try {
-
-        const inquiry = await personaRequest(
-            '/api/v1/inquiries',
-            'POST',
-            {
-                data: {
-                    attributes: {
-                        "inquiry-template-id": TEMPLATE_ID,
-                        "reference-id": referenceId,
-                        "redirect-uri": redirectUri
-                    }
-                },
-                meta: {
-                    "auto-create-one-time-link": true
-                }
-            }
-        );
-
-
-
-        const inquiryId = inquiry.data?.id;
-
-
-        const flowUrl =
-            inquiry.meta?.['one-time-link'] ||
-            inquiry.meta?.['one-time-link-short'];
-
-
-
-        if (!inquiryId) {
-
-            console.error(
-                "Missing inquiry ID:",
-                inquiry
-            );
-
-            return res.status(500).json({
-                error: 'Missing inquiry ID from Persona'
-            });
-
-        }
-
-
-
-        if (!flowUrl) {
-
-            console.error(
-                "Missing flow URL:",
-                inquiry
-            );
-
-            return res.status(500).json({
-                error: 'Missing flow URL from Persona',
-                inquiryId
-            });
-
-        }
-
-
-
-        const { error: insertError } =
-            await supabase
-            .from('verifications')
-            .insert({
-
-                inquiry_id: inquiryId,
-
-                reference_id: referenceId,
-
-                user_id: userId,
-
-                template_id: TEMPLATE_ID,
-
-                status: 'created',
-
-                redirect_uri: redirectUri,
-
-                created_at:
-                    new Date().toISOString(),
-
-                updated_at:
-                    new Date().toISOString()
-
-            });
-
-
-
-        if (insertError) {
-
-            console.error(
-                'Supabase insert error:',
-                insertError
-            );
-
-        }
-
-
-
-        return res.json({
-
-            success: true,
-
-            userId,
-
-            inquiryId,
-
-            referenceId,
-
-            flowUrl
-
-        });
-
-
-
-    } catch (err) {
-
-        console.error(
-            'Error starting verification:',
-            err
-        );
-
-
-        return res.status(502).json({
-
-            error: 'Failed to start verification',
-
-            details:
-                err.body ||
-                err.message
-
-        });
-
-    }
-
+    const { referenceId, userId, redirectUri } = req.body;
+    const result = await startVerificationForUser({ referenceId, userId, redirectUri });
+    return res.status(result.httpStatus).json(result.body);
 });
 
 app.get('/redirect', (req, res) => {
@@ -698,6 +834,9 @@ app.post('/api/webhook', async (req, res) => {
         eventType: body.type
     });
 
+
+    // Persona wraps the actual inquiry inside an Event envelope:
+    // { data: { type: 'event', id: 'evt_...', attributes: { name, payload: { data: <inquiry> } } } }
     const inquiryPayload = body.data?.attributes?.payload?.data;
 
     const inquiryId = inquiryPayload?.id;
@@ -844,64 +983,8 @@ app.post('/api/webhook', async (req, res) => {
 
 app.get('/api/verification-status', async (req, res) => {
     const userId = req.query._id;
-
-    if (!userId) {
-        return res.status(400).json({ error: '_id parameter is required' });
-    }
-
-    try {
-        const { data: verifications, error } = await supabase
-            .from('verifications')
-            .select('*')
-            .eq('user_id', userId)
-            .order('created_at', { ascending: false })
-            .limit(1);
-
-        if (error) {
-            console.error('Supabase query error:', error);
-            return res.status(500).json({ error: 'Database query failed' });
-        }
-
-        if (verifications && verifications.length > 0) {
-            const verification = verifications[0];
-            
-            if (verification.status !== 'created') {
-                return res.json({
-                    _id: verification.user_id,
-                    referenceId: verification.reference_id,
-                    status: verification.status,
-                    verificationStatus: verification.verification_status,
-                    completedAt: verification.updated_at,
-                    verified: verification.status === 'approved' || verification.status === 'completed'
-                });
-            }
-
-            const refreshed = await refreshVerificationFromPersona(verification);
-
-            if (!refreshed) {
-                return res.status(502).json({ error: 'Persona API error' });
-            }
-
-            const status = refreshed.status;
-            const inquiryVerificationStatus = refreshed.verification_status;
-
-            return res.json({
-                _id: verification.user_id,
-                referenceId: verification.reference_id,
-                status: status,
-                verificationStatus: inquiryVerificationStatus,
-                verified: status === 'approved' || status === 'completed' || inquiryVerificationStatus === 'verified'
-            });
-        }
-
-        return res.status(404).json({ error: 'No verification found' });
-
-    } catch (err) {
-        console.error('Error checking status:', err);
-        res.status(500).json({
-            error: 'Failed to check verification status'
-        });
-    }
+    const result = await getVerificationStatusForUser(userId);
+    return res.status(result.httpStatus).json(result.body);
 });
 
 app.get('/logs', (req, res) => {
