@@ -139,23 +139,33 @@ function verifyWebhookSignature(req, rawBody) {
 
 app.get('/internal/worker/verifications', async (req, res) => {
     const userId = req.query._id;
+
     if (!userId) {
-        return res.status(400).json({ error: 'Missing _id parameter' });
+        return res.status(400).json({
+            error: 'Missing _id parameter'
+        });
     }
 
     try {
+
         const { data: verifications, error } = await supabase
             .from('verifications')
             .select('*')
             .eq('user_id', userId)
             .order('created_at', { ascending: false });
 
+
         if (error) {
             console.error('Supabase query error:', error);
-            return res.status(500).json({ error: 'Database query failed' });
+
+            return res.status(500).json({
+                error: 'Database query failed'
+            });
         }
 
+
         if (verifications && verifications.length > 0) {
+
             const userVerifications = verifications.map(v => ({
                 _id: v.user_id,
                 createdAt: v.created_at,
@@ -167,14 +177,25 @@ app.get('/internal/worker/verifications', async (req, res) => {
                 personaAccountId: v.persona_account_id
             }));
 
-            return res.json({ userVerifications });
+            return res.json({
+                userVerifications
+            });
         }
 
-        res.json({ userVerifications: [] });
+
+        return res.json({
+            userVerifications: []
+        });
+
 
     } catch (err) {
-        console.error('Worker verifications error:', err); 
-        res.status(502).json({
+
+        console.error(
+            'Worker verifications error:',
+            err
+        );
+
+        return res.status(502).json({
             error: 'Unable to fetch verifications'
         });
     }
@@ -320,56 +341,111 @@ app.post('/api/webhook', async (req, res) => {
         eventType: body.type
     });
 
+
     const inquiryId = body.data?.id;
-    const status = body.data?.attributes?.status;
-    const referenceId = body.data?.attributes?.['reference-id'];
+
+    const attributes = body.data?.attributes || {};
+
+    const status = attributes.status;
+
+    const referenceId =
+        attributes['reference-id'];
+
     const verificationStatus =
-        body.data?.attributes?.['verification-status'];
+        attributes['verification-status'];
+
 
     const accountId =
         body.data?.relationships?.account?.data?.id;
 
+
+    console.log("Webhook data:", {
+        inquiryId,
+        status,
+        referenceId,
+        verificationStatus,
+        accountId
+    });
+
+
     if (!inquiryId) {
         return res.status(400).json({
-            error: 'Missing inquiry ID'
+            error:'Missing inquiry ID'
         });
     }
 
+
     try {
 
-        console.log(
-            `Verification ${status} for inquiry ${inquiryId}`
-        );
-
-        const { data: existingVerification } = await supabase
+        const { data: existingVerification, error: lookupError } =
+            await supabase
             .from('verifications')
             .select('user_id')
             .eq('inquiry_id', inquiryId)
-            .single();
+            .maybeSingle();
 
 
-        const { error: upsertError } = await supabase
+        if (lookupError) {
+            console.error(
+                "Lookup error:",
+                lookupError
+            );
+        }
+
+
+        const { error: upsertError } =
+            await supabase
             .from('verifications')
             .upsert({
+
                 inquiry_id: inquiryId,
+
                 reference_id: referenceId,
-                user_id: existingVerification?.user_id || null,
+
+                // preserve existing user
+                user_id:
+                    existingVerification?.user_id ?? null,
+
                 status: status,
-                verification_status: verificationStatus,
-                persona_account_id: accountId,
-                webhook_data: body,
-                updated_at: new Date().toISOString()
+
+                verification_status:
+                    verificationStatus,
+
+                persona_account_id:
+                    accountId,
+
+                webhook_data:
+                    body,
+
+                updated_at:
+                    new Date().toISOString()
+
             }, {
-                onConflict: 'inquiry_id'
+                onConflict:'inquiry_id'
             });
 
 
         if (upsertError) {
-            console.error(
-                'Supabase upsert error:',
-                upsertError
-            );
-        }
+    console.error(
+        'Supabase upsert error:',
+        upsertError
+    );
+
+    return res.status(500).json({
+        error: "Supabase update failed",
+        details: upsertError
+    });
+}
+
+        console.log
+                   ("Saved account:", accountId
+
+        );
+
+
+        console.log(
+            `Verification updated ${inquiryId}`
+        );
 
 
         return res.json({
@@ -385,10 +461,19 @@ app.post('/api/webhook', async (req, res) => {
             err
         );
 
+        console.log("ACCOUNT DEBUG:", 
+    JSON.stringify(
+        body.data.relationships.account,
+        null,
+        2
+    )
+);
+
         return res.status(500).json({
             error:'Webhook processing failed'
         });
     }
+
 });
 
 app.get('/api/verification-status', async (req, res) => {
