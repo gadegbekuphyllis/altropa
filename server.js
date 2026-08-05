@@ -223,8 +223,11 @@ app.post('/api/start-verification', async (req, res) => {
 
 
         const inquiryId = inquiry.data?.id;
-
-        const flowUrl =
+        
+        const accountId =
+            inquiry.data?.relationships?.account?.data?.id;
+        
+            const flowUrl =
             inquiry.meta?.['one-time-link'];
 
 
@@ -260,6 +263,7 @@ app.post('/api/start-verification', async (req, res) => {
                 reference_id: referenceId,
                 user_id: userId,
                 template_id: TEMPLATE_ID,
+                persona_account_id: accountId,
                 status: 'created',
                 redirect_uri: redirectUri,
                 created_at: new Date().toISOString(),
