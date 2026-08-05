@@ -90,10 +90,6 @@ function personaRequest(path, method, body = null) {
     });
 }
 
-// --- FIXED: parses Persona's actual "t=<timestamp>,v1=<hex signature>" format,
-// signs "<timestamp>.<rawBody>", and compares as hex (not base64 of the raw body).
-// Also handles the multi-set format used during secret rotation:
-// "t=123,v1=abc t=123,v1=def"
 function verifyWebhookSignature(req, rawBody) {
     const signatureHeader = req.headers['persona-signature'];
 
@@ -191,57 +187,71 @@ app.get('/health', (req, res) =>
 });
 
 app.post('/api/start-verification', async (req, res) => {
-    const { referenceId, userId } = req.body;
+    const { referenceId, userId, redirectUri } = req.body;
 
-    if (!referenceId || !userId) {
+    if (!referenceId || !userId || !redirectUri) {
         return res.status(400).json({
-            error: 'referenceId and userId are required'
+            error: 'referenceId, userId and redirectUri are required'
         });
     }
 
     logUsage({
         endpoint: '/api/start-verification',
         referenceId,
-        userId
+        userId,
+        redirectUri
     });
 
     try {
-        // 1. Create the inquiry
-        const inquiry = await personaRequest('/api/v1/inquiries', 'POST', {
-            data: {
-                attributes: {
-                    "inquiry-template-id": TEMPLATE_ID,
-                    "reference-id": referenceId,
-                    "redirect-uri": "https://scaramouch1.onrender.com/redirect"
+
+        const inquiry = await personaRequest(
+            '/api/v1/inquiries',
+            'POST',
+            {
+                data: {
+                    attributes: {
+                        "inquiry-template-id": TEMPLATE_ID,
+                        "reference-id": referenceId,
+                        "redirect-uri": redirectUri
+                    }
+                },
+                meta: {
+                    "auto-create-one-time-link": true
                 }
             }
-        });
+        );
+
 
         const inquiryId = inquiry.data?.id;
 
-        if (!inquiryId) {
-            console.error("Missing inquiry ID from Persona response:", inquiry);
-            return res.status(500).json({ error: 'Missing inquiry ID from Persona' });
-        }
-
-        // 2. Generate a one-time link for that inquiry (real Persona endpoint)
-        const linkResponse = await personaRequest(
-            `/api/v1/inquiries/${inquiryId}/generate-one-time-link`,
-            'POST',
-            {}
-        );
-
         const flowUrl =
-            linkResponse.meta?.['one-time-link'] ||
-            linkResponse.meta?.['one-time-link-short'];
+            inquiry.meta?.['one-time-link'];
 
-        if (!flowUrl) {
-            console.error("Missing flow URL from Persona response:", linkResponse);
+
+        if (!inquiryId) {
+            console.error(
+                "Missing inquiry ID:",
+                inquiry
+            );
+
             return res.status(500).json({
-                error: 'Missing flow URL from Persona',
-                inquiryId: inquiryId
+                error: 'Missing inquiry ID from Persona'
             });
         }
+
+
+        if (!flowUrl) {
+            console.error(
+                "Missing flow URL:",
+                inquiry
+            );
+
+            return res.status(500).json({
+                error: 'Missing flow URL from Persona',
+                inquiryId
+            });
+        }
+
 
         const { error: insertError } = await supabase
             .from('verifications')
@@ -251,27 +261,39 @@ app.post('/api/start-verification', async (req, res) => {
                 user_id: userId,
                 template_id: TEMPLATE_ID,
                 status: 'created',
+                redirect_uri: redirectUri,
                 created_at: new Date().toISOString(),
                 updated_at: new Date().toISOString()
             });
 
+
         if (insertError) {
-            console.error('Supabase insert error:', insertError);
+            console.error(
+                'Supabase insert error:',
+                insertError
+            );
         }
+
 
         return res.json({
             success: true,
-            userId: userId,
-            inquiryId: inquiryId,
-            flowUrl: flowUrl,
-            referenceId: referenceId
+            userId,
+            inquiryId,
+            referenceId,
+            flowUrl
         });
 
+
     } catch (err) {
-        console.error('Error starting verification:', err);
-        res.status(502).json({
+
+        console.error(
+            'Error starting verification:',
+            err
+        );
+
+        return res.status(502).json({
             error: 'Failed to start verification',
-            details: err.body || err.message || err
+            details: err.body || err.message
         });
     }
 });
