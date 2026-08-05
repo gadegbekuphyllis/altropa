@@ -585,9 +585,7 @@ app.post('/api/webhook', async (req, res) => {
         const { data: existingVerification } =
             await supabase
             .from('verifications')
-            .select(
-                'user_id, reference_id'
-            )
+            .select('user_id, reference_id, persona_account_id')
             .eq(
                 'inquiry_id',
                 inquiryId
@@ -613,7 +611,7 @@ app.post('/api/webhook', async (req, res) => {
                 verificationStatus || null,
 
             persona_account_id:
-                accountId || null,
+                accountId || existingVerification?.persona_account_id || null,
 
             webhook_data:
                 body,
@@ -754,12 +752,14 @@ app.get('/api/verification-status', async (req, res) => {
             const inquiry = parsed.data;
             const status = inquiry.attributes?.status || 'unknown';
             const inquiryVerificationStatus = inquiry.attributes?.['verification-status'] || null;
+            const accountId = inquiry.relationships?.account?.data?.id || null;
 
             const { error: updateError } = await supabase
                 .from('verifications')
                 .update({
                     status: status,
                     verification_status: inquiryVerificationStatus,
+                    persona_account_id: accountId || undefined,
                     updated_at: new Date().toISOString()
                 })
                 .eq('id', verification.id);
