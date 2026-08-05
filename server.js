@@ -546,9 +546,11 @@ app.post('/api/webhook', async (req, res) => {
     });
 
 
-    const inquiryId = body.data?.id;
+    const inquiryPayload = body.data?.attributes?.payload?.data;
 
-    const attributes = body.data?.attributes || {};
+    const inquiryId = inquiryPayload?.id;
+
+    const attributes = inquiryPayload?.attributes || {};
 
     const status = attributes.status;
 
@@ -557,7 +559,7 @@ app.post('/api/webhook', async (req, res) => {
     const verificationStatus = attributes['verification-status'];
 
     const accountId =
-        body.data?.relationships?.account?.data?.id;
+        inquiryPayload?.relationships?.account?.data?.id;
 
 
 
