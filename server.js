@@ -90,40 +90,50 @@ function personaRequest(path, method, body = null) {
     });
 }
 
+// --- FIXED: parses Persona's actual "t=<timestamp>,v1=<hex signature>" format,
+// signs "<timestamp>.<rawBody>", and compares as hex (not base64 of the raw body).
+// Also handles the multi-set format used during secret rotation:
+// "t=123,v1=abc t=123,v1=def"
 function verifyWebhookSignature(req, rawBody) {
-    const signature = req.headers['persona-signature'];
+    const signatureHeader = req.headers['persona-signature'];
 
-    if (!signature) {
+    if (!signatureHeader) {
         console.error('Missing persona-signature header');
         return false;
     }
 
     try {
-        const hmac = crypto.createHmac('sha256', WEBHOOK_SECRET);
-        hmac.update(rawBody);
+        const sets = signatureHeader.split(' ');
 
-        const computed = hmac.digest('base64');
-
-        const computedBuffer = Buffer.from(computed);
-        const signatureBuffer = Buffer.from(signature);
-
-        if (computedBuffer.length !== signatureBuffer.length) {
-            console.error(
-                'Signature length mismatch:',
-                computedBuffer.length,
-                signatureBuffer.length
+        for (const set of sets) {
+            const parts = Object.fromEntries(
+                set.split(',').map(kv => kv.split('='))
             );
-            return false;
+
+            const { t: timestamp, v1: signature } = parts;
+
+            if (!timestamp || !signature) continue;
+
+            const signedPayload = `${timestamp}.${rawBody}`;
+
+            const expected = crypto
+                .createHmac('sha256', WEBHOOK_SECRET)
+                .update(signedPayload)
+                .digest('hex');
+
+            const expectedBuffer = Buffer.from(expected, 'hex');
+            const signatureBuffer = Buffer.from(signature, 'hex');
+
+            if (
+                expectedBuffer.length === signatureBuffer.length &&
+                crypto.timingSafeEqual(expectedBuffer, signatureBuffer)
+            ) {
+                return true;
+            }
         }
 
-        const isValid = crypto.timingSafeEqual(
-            computedBuffer,
-            signatureBuffer
-        );
-
-        console.log('Webhook signature valid:', isValid);
-
-        return isValid;
+        console.error('No matching signature found in persona-signature header');
+        return false;
 
     } catch (err) {
         console.error('Signature verification error:', err);
