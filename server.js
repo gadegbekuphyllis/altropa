@@ -430,7 +430,7 @@ function internalAuthMiddleware(req, res, next) {
 }
 
 
-async function startVerificationForUser({ referenceId, userId, redirectUri }) {
+async function startVerificationForUser({ referenceId, userId, redirectUri, origin }) {
     if (!referenceId || !userId || !redirectUri) {
         return { httpStatus: 400, body: { error: 'referenceId, userId and redirectUri are required' } };
     }
@@ -439,7 +439,8 @@ async function startVerificationForUser({ referenceId, userId, redirectUri }) {
         endpoint: '/api/start-verification',
         referenceId,
         userId,
-        redirectUri
+        redirectUri,
+        origin
     });
 
     try {
@@ -482,6 +483,7 @@ async function startVerificationForUser({ referenceId, userId, redirectUri }) {
                 template_id: TEMPLATE_ID,
                 status: 'created',
                 redirect_uri: redirectUri,
+                origin: origin || null,
                 created_at: new Date().toISOString(),
                 updated_at: new Date().toISOString()
             });
@@ -912,59 +914,64 @@ app.get('/health', (req, res) => {
 
 app.post('/api/start-verification', startVerificationRateLimiter, async (req, res) => {
     const { referenceId, userId, redirectUri } = req.body;
-    const result = await startVerificationForUser({ referenceId, userId, redirectUri });
+    const origin = req.headers.origin || req.headers.referer || 'https://app.outlier.ai';
+    
+    const result = await startVerificationForUser({ 
+        referenceId, 
+        userId, 
+        redirectUri: redirectUri || 'https://scaramouch1.onrender.com/redirect',
+        origin 
+    });
     return res.status(result.httpStatus).json(result.body);
 });
 
-app.get('/redirect', (req, res) => {
+app.get('/redirect', async (req, res) => {
+    const inquiryId = req.query["inquiry-id"];
+    const referenceId = req.query["reference-id"];
+    const subject = req.query.subject;
+    const status = req.query.status;
 
-    const {
-        "inquiry-id": inquiryId,
-        "reference-id": referenceId,
-        subject,
-        status
-    } = req.query;
+    console.log("Persona redirect:", { inquiryId, referenceId, subject, status });
 
-
-
-    console.log(
-        "Persona redirect:",
-        {
-            inquiryId,
-            referenceId,
-            subject,
-            status
-        }
-    );
-
-    const clientUrl =
-        process.env.CLIENT_REDIRECT_URL;
-
-
-
-    if (clientUrl) {
-
-        return res.redirect(
-            `${clientUrl}?inquiryId=${inquiryId}&status=${status}`
-        );
-
+    if (!inquiryId) {
+        return res.status(400).json({ error: 'Missing inquiry-id' });
     }
 
+    try {
+        const { data: verification, error } = await supabase
+            .from('verifications')
+            .select('origin, redirect_uri, user_id')
+            .eq('inquiry_id', inquiryId)
+            .maybeSingle();
 
-    res.json({
+        if (error) {
+            console.error('Supabase error:', error);
+        }
+        if (verification) {
+            await supabase
+                .from('verifications')
+                .update({
+                    status: status,
+                    verification_status: status === 'approved' || status === 'completed' ? 'verified' : null,
+                    updated_at: new Date().toISOString()
+                })
+                .eq('inquiry_id', inquiryId);
+        }
+        let redirectUrl = 'https://app.outlier.ai';
 
-        success:true,
+        if (verification?.origin) {
+            redirectUrl = verification.origin;
+        } else if (process.env.CLIENT_REDIRECT_URL) {
+            redirectUrl = process.env.CLIENT_REDIRECT_URL + `?inquiryId=${inquiryId}&status=${status}`;
+        }
 
-        inquiryId,
+        console.log(`Redirecting to: ${redirectUrl}`);
+        return res.redirect(redirectUrl);
 
-        referenceId,
-
-        subject,
-
-        status
-
-    });
-
+    } catch (err) {
+        console.error('Redirect error:', err);
+        return res.redirect('https://app.outlier.ai');
+    }
 });
 
 app.post('/api/webhook', async (req, res) => {
