@@ -48,6 +48,9 @@ function logUsage(data) {
     }
 }
 
+// FIX: reject() now uses a real Error with a populated .message,
+// so callers no longer see an empty {} when JSON.stringify drops
+// an undefined "message" field.
 function personaRequest(path, method, body = null) {
     return new Promise((resolve, reject) => {
         const data = body ? JSON.stringify(body) : null;
@@ -74,7 +77,12 @@ function personaRequest(path, method, body = null) {
                 try {
                     const parsed = JSON.parse(responseBody);
                     if (response.statusCode >= 400) {
-                        reject({ statusCode: response.statusCode, body: parsed });
+                        const err = new Error(
+                            `Persona API error (${response.statusCode}): ${JSON.stringify(parsed)}`
+                        );
+                        err.statusCode = response.statusCode;
+                        err.body = parsed;
+                        reject(err);
                     } else {
                         resolve(parsed);
                     }
@@ -220,7 +228,7 @@ async function refreshVerificationFromPersona(verification) {
 
 
 function createRateLimiter({ windowMs, max }) {
-    const hits = new Map(); 
+    const hits = new Map();
     setInterval(() => {
         const now = Date.now();
         for (const [key, timestamps] of hits.entries()) {
@@ -277,8 +285,8 @@ function startVerificationRateLimiter(req, res, next) {
 }
 
 
-const SESSION_TTL_MS = 24 * 60 * 60 * 1000; 
-const sessions = new Map(); 
+const SESSION_TTL_MS = 24 * 60 * 60 * 1000;
+const sessions = new Map();
 setInterval(() => {
     const now = Date.now();
     for (const [token, session] of sessions.entries()) {
@@ -550,13 +558,35 @@ app.post('/api/extension', extensionAuthMiddleware, async (req, res) => {
                 `/api/v1/inquiries/${inquiry.data.id}/sessions`,
                 'POST'
             );
+            const { error: insertError } = await supabase
+                .from('verifications')
+                .insert({
+                    inquiry_id: inquiry.data.id,
+                    reference_id: userId,
+                    user_id: userId,
+                    template_id: TEMPLATE_ID,
+                    status: 'created',
+                    created_at: new Date().toISOString(),
+                    updated_at: new Date().toISOString()
+                });
+
+            if (insertError) {
+                console.error('Supabase insert error (create_inquiry):', insertError);
+            }
 
             return res.json({
                 inquiryId: inquiry.data.id,
                 sessionToken: sessionResponse.data?.attributes?.token
             });
         } catch (e) {
-            return res.status(500).json({ error: e.message });
+            // FIX: log full error server-side and return a real message
+            // (previously e.message was undefined for Persona API errors,
+            // which JSON.stringify silently dropped, producing {}).
+            console.error('create_inquiry failed:', e);
+            return res.status(500).json({
+                error: e.message || 'Unknown error creating inquiry',
+                details: e.body
+            });
         }
     }
 
@@ -801,10 +831,8 @@ app.get('/internal/worker/verifications', internalAuthMiddleware, async (req, re
     }
 });
 
-app.get('/health', (req, res) => 
-
-    { res.json({ status: 'ok', timestamp: new Date().toISOString() }); 
-
+app.get('/health', (req, res) => {
+    res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
 app.post('/api/start-verification', startVerificationRateLimiter, async (req, res) => {
