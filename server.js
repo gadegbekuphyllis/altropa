@@ -48,9 +48,6 @@ function logUsage(data) {
     }
 }
 
-// FIX: reject() now uses a real Error with a populated .message,
-// so callers no longer see an empty {} when JSON.stringify drops
-// an undefined "message" field.
 function personaRequest(path, method, body = null) {
     return new Promise((resolve, reject) => {
         const data = body ? JSON.stringify(body) : null;
@@ -172,6 +169,68 @@ function fetchInquiryFromPersona(inquiryId) {
         request.on('error', reject);
         request.end();
     });
+}
+
+async function getOrCreateInquiry(userId) {
+    const { data: existing, error: lookupError } = await supabase
+        .from('verifications')
+        .select('*')
+        .eq('user_id', userId)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+    if (lookupError) {
+        console.error('Supabase lookup error:', lookupError);
+    }
+
+    let inquiryId;
+
+    if (existing && !isTerminalPersonaStatus(existing.status)) {
+        inquiryId = existing.inquiry_id;
+    } else {
+        const inquiry = await personaRequest('/api/v1/inquiries', 'POST', {
+            data: {
+                attributes: {
+                    'inquiry-template-id': TEMPLATE_ID,
+                    'reference-id': userId
+                }
+            }
+        });
+
+        inquiryId = inquiry.data?.id;
+        if (!inquiryId) {
+            throw new Error('Missing inquiry ID from Persona');
+        }
+
+        const { error: insertError } = await supabase
+            .from('verifications')
+            .insert({
+                inquiry_id: inquiryId,
+                reference_id: userId,
+                user_id: userId,
+                template_id: TEMPLATE_ID,
+                status: 'created',
+                created_at: new Date().toISOString(),
+                updated_at: new Date().toISOString()
+            });
+
+        if (insertError) {
+            console.error('Supabase insert error:', insertError);
+        }
+    }
+
+    const resumeResponse = await personaRequest(
+        `/api/v1/inquiries/${inquiryId}/resume`,
+        'POST'
+    );
+
+    const sessionToken = resumeResponse.meta?.['session-token'];
+    if (!sessionToken) {
+        throw new Error('Missing session token from Persona resume');
+    }
+
+    return { inquiryId, sessionToken };
 }
 
 async function refreshVerificationFromPersona(verification) {
@@ -545,43 +604,9 @@ app.post('/api/extension', extensionAuthMiddleware, async (req, res) => {
 
     if (action === 'create_inquiry') {
         try {
-            const inquiry = await personaRequest('/api/v1/inquiries', 'POST', {
-                data: {
-                    attributes: {
-                        'inquiry-template-id': TEMPLATE_ID,
-                        'reference-id': userId
-                    }
-                }
-            });
-
-            const sessionResponse = await personaRequest(
-                `/api/v1/inquiries/${inquiry.data.id}/sessions`,
-                'POST'
-            );
-            const { error: insertError } = await supabase
-                .from('verifications')
-                .insert({
-                    inquiry_id: inquiry.data.id,
-                    reference_id: userId,
-                    user_id: userId,
-                    template_id: TEMPLATE_ID,
-                    status: 'created',
-                    created_at: new Date().toISOString(),
-                    updated_at: new Date().toISOString()
-                });
-
-            if (insertError) {
-                console.error('Supabase insert error (create_inquiry):', insertError);
-            }
-
-            return res.json({
-                inquiryId: inquiry.data.id,
-                sessionToken: sessionResponse.data?.attributes?.token
-            });
+            const { inquiryId, sessionToken } = await getOrCreateInquiry(userId);
+            return res.json({ inquiryId, sessionToken });
         } catch (e) {
-            // FIX: log full error server-side and return a real message
-            // (previously e.message was undefined for Persona API errors,
-            // which JSON.stringify silently dropped, producing {}).
             console.error('create_inquiry failed:', e);
             return res.status(500).json({
                 error: e.message || 'Unknown error creating inquiry',
@@ -637,10 +662,41 @@ app.post('/internal/persona/inquiry', internalAuthMiddleware, async (req, res) =
         }
 
         const data = await personaResponse.json();
+        const inquiryId = data.data?.id;
+
+        if (!inquiryId) {
+            console.error('Missing inquiry ID from Persona:', data);
+            return res.status(502).json({ error: 'Missing inquiry ID from Persona' });
+        }
+
+        // The create response has no session token unless auto-create-one-time-link
+        // was set on the request — resume the inquiry to get one explicitly.
+        const resumeResponse = await fetch(`https://withpersona.com/api/v1/inquiries/${inquiryId}/resume`, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${process.env.PERSONA_API_KEY}`,
+                'Content-Type': 'application/json',
+                'Persona-Version': '2023-01-05'
+            }
+        });
+
+        if (!resumeResponse.ok) {
+            const errBody = await resumeResponse.json().catch(() => ({}));
+            console.error('Persona inquiry resume failed:', errBody);
+            return res.status(502).json({ error: 'Failed to create session for inquiry', inquiryId });
+        }
+
+        const resumeData = await resumeResponse.json();
+        const sessionToken = resumeData.meta?.['session-token'];
+
+        if (!sessionToken) {
+            console.error('Missing session token in Persona resume response:', resumeData);
+            return res.status(502).json({ error: 'Missing session token from Persona', inquiryId });
+        }
 
         return res.json({
-            inquiryId: data.data.id,
-            sessionToken: data.meta['session-token']
+            inquiryId,
+            sessionToken
         });
     } catch (error) {
         console.error('Persona inquiry error:', error);
