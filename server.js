@@ -338,6 +338,14 @@ function extensionAuthMiddleware(req, res, next) {
     next();
 }
 
+function internalAuthMiddleware(req, res, next) {
+    const key = req.headers['x-internal-api-key'];
+    if (!key || key !== process.env.INTERNAL_API_KEY) {
+        return res.status(401).json({ error: 'Unauthorized' });
+    }
+    next();
+}
+
 
 async function startVerificationForUser({ referenceId, userId, redirectUri }) {
     if (!referenceId || !userId || !redirectUri) {
@@ -527,22 +535,90 @@ app.post('/api/extension', extensionAuthMiddleware, async (req, res) => {
         return res.status(result.httpStatus).json(result.body);
     }
 
+    if (action === 'create_inquiry') {
+        try {
+            const inquiry = await personaRequest('/api/v1/inquiries', 'POST', {
+                data: {
+                    attributes: {
+                        'inquiry-template-id': TEMPLATE_ID,
+                        'reference-id': userId
+                    }
+                }
+            });
+
+            const sessionResponse = await personaRequest(
+                `/api/v1/inquiries/${inquiry.data.id}/sessions`,
+                'POST'
+            );
+
+            return res.json({
+                inquiryId: inquiry.data.id,
+                sessionToken: sessionResponse.data?.attributes?.token
+            });
+        } catch (e) {
+            return res.status(500).json({ error: e.message });
+        }
+    }
+
     if (action === 'verification_status') {
         const result = await getVerificationStatusForUser(userId);
         return res.status(result.httpStatus).json(result.body);
     }
 
     if (action === 'get_persona_config') {
-    return res.json({
-        templateId: TEMPLATE_ID,
-        environmentId: process.env.PERSONA_ENVIRONMENT_ID
-    });
-}
+        return res.json({
+            templateId: TEMPLATE_ID,
+            environmentId: process.env.PERSONA_ENVIRONMENT_ID
+        });
+    }
 
     return res.status(400).json({ error: `Unknown action: ${action}` });
 });
 
-app.get('/internal/persona/most-recent-inquiry', async (req, res) => {
+app.post('/internal/persona/inquiry', internalAuthMiddleware, async (req, res) => {
+    const { userId } = req.body;
+
+    if (!userId) {
+        return res.status(400).json({ error: 'Missing userId' });
+    }
+
+    try {
+        const personaResponse = await fetch('https://withpersona.com/api/v1/inquiries', {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${process.env.PERSONA_API_KEY}`,
+                'Content-Type': 'application/json',
+                'Persona-Version': '2023-01-05'
+            },
+            body: JSON.stringify({
+                data: {
+                    attributes: {
+                        'inquiry-template-id': process.env.PERSONA_TEMPLATE_ID,
+                        'reference-id': userId
+                    }
+                }
+            })
+        });
+
+        if (!personaResponse.ok) {
+            const errBody = await personaResponse.json().catch(() => ({}));
+            console.error('Persona inquiry creation failed:', errBody);
+            return res.status(502).json({ error: 'Failed to create inquiry' });
+        }
+
+        const data = await personaResponse.json();
+
+        return res.json({
+            inquiryId: data.data.id,
+            sessionToken: data.meta['session-token']
+        });
+    } catch (error) {
+        console.error('Persona inquiry error:', error);
+        return res.status(500).json({ error: 'Internal error' });
+    }
+});
+
+app.get('/internal/persona/most-recent-inquiry', internalAuthMiddleware, async (req, res) => {
 
     const userId = req.query._id;
 
@@ -653,7 +729,7 @@ app.get('/internal/persona/most-recent-inquiry', async (req, res) => {
 
 });
 
-app.get('/internal/worker/verifications', async (req, res) => {
+app.get('/internal/worker/verifications', internalAuthMiddleware, async (req, res) => {
     const userId = req.query._id;
 
     if (!userId) {
@@ -967,13 +1043,7 @@ app.post('/api/webhook', async (req, res) => {
 
 });
 
-app.get('/api/verification-status', async (req, res) => {
-    const userId = req.query._id;
-    const result = await getVerificationStatusForUser(userId);
-    return res.status(result.httpStatus).json(result.body);
-});
-
-app.get('/logs', (req, res) => {
+app.get('/logs', internalAuthMiddleware, (req, res) => {
     try {
         if (fs.existsSync(LOG_FILE)) {
             const logs = JSON.parse(fs.readFileSync(LOG_FILE, 'utf8'));
