@@ -186,7 +186,12 @@ async function getOrCreateInquiry(userId) {
 
     let inquiryId;
 
-    if (existing && !isTerminalPersonaStatus(existing.status)) {
+    if (existing && ['failed', 'declined', 'needs_review'].includes(existing.status)) {
+        const err = new Error('A previous verification for this user did not succeed. Contact support to retry.');
+        err.code = 'VERIFICATION_BLOCKED';
+        err.priorStatus = existing.status;
+        throw err;
+    } else if (existing && !isTerminalPersonaStatus(existing.status)) {
         inquiryId = existing.inquiry_id;
     } else {
         const inquiry = await personaRequest('/api/v1/inquiries', 'POST', {
@@ -232,7 +237,6 @@ async function getOrCreateInquiry(userId) {
 
     return { inquiryId, sessionToken };
 }
-
 async function refreshVerificationFromPersona(verification) {
     if (!verification || !verification.inquiry_id) return null;
 
@@ -345,48 +349,60 @@ function startVerificationRateLimiter(req, res, next) {
 
 
 const SESSION_TTL_MS = 24 * 60 * 60 * 1000;
-const sessions = new Map();
 setInterval(() => {
-    const now = Date.now();
-    for (const [token, session] of sessions.entries()) {
-        if (session.expiresAt < now) {
-            sessions.delete(token);
-        }
-    }
+    supabase
+        .from('sessions')
+        .delete()
+        .lt('expires_at', new Date().toISOString())
+        .then(({ error }) => {
+            if (error) console.error('Session cleanup error:', error);
+        });
 }, 60 * 60 * 1000).unref();
 
 function isValidExtensionId(id) {
     return typeof id === 'string' && /^[a-p]{32}$/.test(id);
 }
 
-function issueSessionToken(extensionId) {
+async function issueSessionToken(extensionId) {
     const token = crypto.randomBytes(32).toString('hex');
-    sessions.set(token, {
-        extensionId,
-        expiresAt: Date.now() + SESSION_TTL_MS
-    });
+    const expiresAt = new Date(Date.now() + SESSION_TTL_MS).toISOString();
+    const { error } = await supabase
+        .from('sessions')
+        .insert({ token, extension_id: extensionId, expires_at: expiresAt });
+    if (error) {
+        console.error('Supabase session insert error:', error);
+        throw new Error('Failed to create session');
+    }
     return token;
 }
 
-function validateSession(token, extensionId) {
+async function validateSession(token, extensionId) {
     if (!token || !extensionId) return false;
-    const session = sessions.get(token);
-    if (!session) return false;
-    if (session.expiresAt < Date.now()) {
-        sessions.delete(token);
+    const { data: session, error } = await supabase
+        .from('sessions')
+        .select('extension_id, expires_at')
+        .eq('token', token)
+        .maybeSingle();
+    if (error) {
+        console.error('Supabase session lookup error:', error);
         return false;
     }
-    return session.extensionId === extensionId;
+    if (!session) return false;
+    if (new Date(session.expires_at).getTime() < Date.now()) {
+        await supabase.from('sessions').delete().eq('token', token);
+        return false;
+    }
+    return session.extension_id === extensionId;
 }
 
 const checkSessionIpRateLimit = createRateLimiter({ windowMs: 10 * 60 * 1000, max: 10 });
 const checkExtensionActionRateLimit = createRateLimiter({ windowMs: 10 * 60 * 1000, max: 10 });
 
-function extensionAuthMiddleware(req, res, next) {
+async function extensionAuthMiddleware(req, res, next) {
     const token = req.headers['x-session-token'];
     const extensionId = req.headers['x-extension-id'];
 
-    if (!validateSession(token, extensionId)) {
+    if (!(await validateSession(token, extensionId))) {
         return res.status(401).json({
             error: 'Invalid or expired session. Please re-initialize and try again.'
         });
@@ -556,7 +572,7 @@ const ALLOWED_EXTENSION_IDS = new Set([
     'lmifennglkmmanneighhdeopefefiaom',
 ]);
 
-app.post('/auth/session', (req, res) => {
+app.post('/auth/session', async (req, res) => {
     const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket.remoteAddress || 'unknown';
 
     const ipResult = checkSessionIpRateLimit(`ip:${ip}`);
@@ -578,7 +594,7 @@ app.post('/auth/session', (req, res) => {
         return res.status(403).json({ error: 'Unknown extension' });
     }
 
-    const token = issueSessionToken(extensionId);
+    const token = await issueSessionToken(extensionId);
 
     logUsage({ endpoint: '/auth/session', extensionId });
 
@@ -607,6 +623,13 @@ app.post('/api/extension', extensionAuthMiddleware, async (req, res) => {
             const { inquiryId, sessionToken } = await getOrCreateInquiry(userId);
             return res.json({ inquiryId, sessionToken });
         } catch (e) {
+            if (e.code === 'VERIFICATION_BLOCKED') {
+                console.warn('Blocked repeat verification attempt:', userId, e.priorStatus);
+                return res.status(403).json({
+                    error: e.message,
+                    priorStatus: e.priorStatus
+                });
+            }
             console.error('create_inquiry failed:', e);
             return res.status(500).json({
                 error: e.message || 'Unknown error creating inquiry',
@@ -614,7 +637,6 @@ app.post('/api/extension', extensionAuthMiddleware, async (req, res) => {
             });
         }
     }
-
     if (action === 'verification_status') {
         const result = await getVerificationStatusForUser(userId);
         return res.status(result.httpStatus).json(result.body);
@@ -668,9 +690,6 @@ app.post('/internal/persona/inquiry', internalAuthMiddleware, async (req, res) =
             console.error('Missing inquiry ID from Persona:', data);
             return res.status(502).json({ error: 'Missing inquiry ID from Persona' });
         }
-
-        // The create response has no session token unless auto-create-one-time-link
-        // was set on the request — resume the inquiry to get one explicitly.
         const resumeResponse = await fetch(`https://withpersona.com/api/v1/inquiries/${inquiryId}/resume`, {
             method: 'POST',
             headers: {
