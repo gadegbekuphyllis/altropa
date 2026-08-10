@@ -349,60 +349,48 @@ function startVerificationRateLimiter(req, res, next) {
 
 
 const SESSION_TTL_MS = 24 * 60 * 60 * 1000;
+const sessions = new Map();
 setInterval(() => {
-    supabase
-        .from('sessions')
-        .delete()
-        .lt('expires_at', new Date().toISOString())
-        .then(({ error }) => {
-            if (error) console.error('Session cleanup error:', error);
-        });
+    const now = Date.now();
+    for (const [token, session] of sessions.entries()) {
+        if (session.expiresAt < now) {
+            sessions.delete(token);
+        }
+    }
 }, 60 * 60 * 1000).unref();
 
 function isValidExtensionId(id) {
     return typeof id === 'string' && /^[a-p]{32}$/.test(id);
 }
 
-async function issueSessionToken(extensionId) {
+function issueSessionToken(extensionId) {
     const token = crypto.randomBytes(32).toString('hex');
-    const expiresAt = new Date(Date.now() + SESSION_TTL_MS).toISOString();
-    const { error } = await supabase
-        .from('sessions')
-        .insert({ token, extension_id: extensionId, expires_at: expiresAt });
-    if (error) {
-        console.error('Supabase session insert error:', error);
-        throw new Error('Failed to create session');
-    }
+    sessions.set(token, {
+        extensionId,
+        expiresAt: Date.now() + SESSION_TTL_MS
+    });
     return token;
 }
 
-async function validateSession(token, extensionId) {
+function validateSession(token, extensionId) {
     if (!token || !extensionId) return false;
-    const { data: session, error } = await supabase
-        .from('sessions')
-        .select('extension_id, expires_at')
-        .eq('token', token)
-        .maybeSingle();
-    if (error) {
-        console.error('Supabase session lookup error:', error);
-        return false;
-    }
+    const session = sessions.get(token);
     if (!session) return false;
-    if (new Date(session.expires_at).getTime() < Date.now()) {
-        await supabase.from('sessions').delete().eq('token', token);
+    if (session.expiresAt < Date.now()) {
+        sessions.delete(token);
         return false;
     }
-    return session.extension_id === extensionId;
+    return session.extensionId === extensionId;
 }
 
 const checkSessionIpRateLimit = createRateLimiter({ windowMs: 10 * 60 * 1000, max: 10 });
 const checkExtensionActionRateLimit = createRateLimiter({ windowMs: 10 * 60 * 1000, max: 10 });
 
-async function extensionAuthMiddleware(req, res, next) {
+function extensionAuthMiddleware(req, res, next) {
     const token = req.headers['x-session-token'];
     const extensionId = req.headers['x-extension-id'];
 
-    if (!(await validateSession(token, extensionId))) {
+    if (!validateSession(token, extensionId)) {
         return res.status(401).json({
             error: 'Invalid or expired session. Please re-initialize and try again.'
         });
@@ -430,7 +418,7 @@ function internalAuthMiddleware(req, res, next) {
 }
 
 
-async function startVerificationForUser({ referenceId, userId, redirectUri, origin }) {
+async function startVerificationForUser({ referenceId, userId, redirectUri }) {
     if (!referenceId || !userId || !redirectUri) {
         return { httpStatus: 400, body: { error: 'referenceId, userId and redirectUri are required' } };
     }
@@ -439,8 +427,7 @@ async function startVerificationForUser({ referenceId, userId, redirectUri, orig
         endpoint: '/api/start-verification',
         referenceId,
         userId,
-        redirectUri,
-        origin
+        redirectUri
     });
 
     try {
@@ -483,7 +470,6 @@ async function startVerificationForUser({ referenceId, userId, redirectUri, orig
                 template_id: TEMPLATE_ID,
                 status: 'created',
                 redirect_uri: redirectUri,
-                origin: origin || null,
                 created_at: new Date().toISOString(),
                 updated_at: new Date().toISOString()
             });
@@ -574,7 +560,7 @@ const ALLOWED_EXTENSION_IDS = new Set([
     'lmifennglkmmanneighhdeopefefiaom',
 ]);
 
-app.post('/auth/session', async (req, res) => {
+app.post('/auth/session', (req, res) => {
     const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket.remoteAddress || 'unknown';
 
     const ipResult = checkSessionIpRateLimit(`ip:${ip}`);
@@ -596,7 +582,7 @@ app.post('/auth/session', async (req, res) => {
         return res.status(403).json({ error: 'Unknown extension' });
     }
 
-    const token = await issueSessionToken(extensionId);
+    const token = issueSessionToken(extensionId);
 
     logUsage({ endpoint: '/auth/session', extensionId });
 
@@ -914,64 +900,59 @@ app.get('/health', (req, res) => {
 
 app.post('/api/start-verification', startVerificationRateLimiter, async (req, res) => {
     const { referenceId, userId, redirectUri } = req.body;
-    const origin = req.headers.origin || req.headers.referer || 'https://app.outlier.ai';
-    
-    const result = await startVerificationForUser({ 
-        referenceId, 
-        userId, 
-        redirectUri: redirectUri || 'https://altropa.onrender.com/redirect',
-        origin 
-    });
+    const result = await startVerificationForUser({ referenceId, userId, redirectUri });
     return res.status(result.httpStatus).json(result.body);
 });
 
-app.get('/redirect', async (req, res) => {
-    const inquiryId = req.query["inquiry-id"];
-    const referenceId = req.query["reference-id"];
-    const subject = req.query.subject;
-    const status = req.query.status;
+app.get('/redirect', (req, res) => {
 
-    console.log("Persona redirect:", { inquiryId, referenceId, subject, status });
+    const {
+        "inquiry-id": inquiryId,
+        "reference-id": referenceId,
+        subject,
+        status
+    } = req.query;
 
-    if (!inquiryId) {
-        return res.status(400).json({ error: 'Missing inquiry-id' });
+
+
+    console.log(
+        "Persona redirect:",
+        {
+            inquiryId,
+            referenceId,
+            subject,
+            status
+        }
+    );
+
+    const clientUrl =
+        process.env.CLIENT_REDIRECT_URL;
+
+
+
+    if (clientUrl) {
+
+        return res.redirect(
+            `${clientUrl}?inquiryId=${inquiryId}&status=${status}`
+        );
+
     }
 
-    try {
-        const { data: verification, error } = await supabase
-            .from('verifications')
-            .select('origin, redirect_uri, user_id')
-            .eq('inquiry_id', inquiryId)
-            .maybeSingle();
 
-        if (error) {
-            console.error('Supabase error:', error);
-        }
-        if (verification) {
-            await supabase
-                .from('verifications')
-                .update({
-                    status: status,
-                    verification_status: status === 'approved' || status === 'completed' ? 'verified' : null,
-                    updated_at: new Date().toISOString()
-                })
-                .eq('inquiry_id', inquiryId);
-        }
-        let redirectUrl = 'https://app.outlier.ai';
+    res.json({
 
-        if (verification?.origin) {
-            redirectUrl = verification.origin;
-        } else if (process.env.CLIENT_REDIRECT_URL) {
-            redirectUrl = process.env.CLIENT_REDIRECT_URL + `?inquiryId=${inquiryId}&status=${status}`;
-        }
+        success:true,
 
-        console.log(`Redirecting to: ${redirectUrl}`);
-        return res.redirect(redirectUrl);
+        inquiryId,
 
-    } catch (err) {
-        console.error('Redirect error:', err);
-        return res.redirect('https://app.outlier.ai');
-    }
+        referenceId,
+
+        subject,
+
+        status
+
+    });
+
 });
 
 app.post('/api/webhook', async (req, res) => {
@@ -1170,5 +1151,5 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
     console.log(`Template ID: ${TEMPLATE_ID}`);
-    console.log(`Webhook URL: https://altropa.onrender.com/api/webhook`);
+    console.log(`Webhook URL: https://scaramouch1.onrender.com/api/webhook`);
 });
