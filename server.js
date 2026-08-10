@@ -727,14 +727,18 @@ app.post('/internal/persona/inquiry', internalAuthMiddleware, async (req, res) =
 
 app.get('/internal/persona/most-recent-inquiry', internalAuthMiddleware, async (req, res) => {
 
-    const userId = req.query._id;
-
+    const userId = req.query._id || req.query.userId || req.query.referenceId;
+    
     if (!userId) {
-        return res.status(400).json({
-            error: 'Missing _id parameter'
+        return res.json({
+            status: "CREATED",
+            inquiryId: null,
+            failureReasons: [],
+            latestFailureReasons: [],
+            remainingAttempts: 3,
+            createdAt: new Date().toISOString()
         });
     }
-
 
     try {
 
